@@ -20,7 +20,7 @@ redis_conn = None
 redis_expired = 120
 
 FEE_PER_BYTE_COIN = config.Fee_Per_Byte_Coin.split(",")
-XS_COIN = ["DEGO"]
+XS_COIN = [""]
 
 pymysqlpool.logger.setLevel('DEBUG')
 myconfig = {
@@ -237,7 +237,7 @@ async def sql_update_balances(coin: str):
         except Exception as e:
             traceback.print_exc(file=sys.stdout)
 
-    if coin_family == "TRTL" and (COIN_NAME not in XS_COIN):
+    if coin_family == "TRTL" and COIN_NAME not in XS_COIN:
         print('SQL: Updating get_transfers '+COIN_NAME)
         get_transfers = await walletapi.get_transfers_cn(COIN_NAME)
         if len(get_transfers) >= 1:
