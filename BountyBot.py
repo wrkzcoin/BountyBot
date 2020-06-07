@@ -18,6 +18,7 @@ import re, redis
 
 import store, addressvalidation, walletapi
 from wallet import *
+from generic_xmr.address_xmr import address_xmr as address_xmr
 
 # MySQL
 import pymysql, pymysqlpool
@@ -29,6 +30,7 @@ from typing import List, Dict
 # Coin using wallet-api
 ENABLE_COIN = config.Enable_Coin.split(",")
 ENABLE_XMR = config.Enable_Coin_XMR.split(",")
+WITHDRAW_IN_PROCESS = []
 
 redis_pool = None
 redis_conn = None
@@ -42,6 +44,8 @@ EMOJI_RED_NO = "\u26D4"
 EMOJI_REFRESH = "\U0001F504"
 EMOJI_OK_HAND = "\U0001F44D"
 EMOJI_MONEYBAG = "\U0001F4B0"
+EMOJI_QUESTEXCLAIM = "\u2049"
+EMOJI_ARROW_RIGHTHOOK = "\u21AA"
 
 COMMAND_IN_PROGRESS = []
 IS_RESTARTING = False
@@ -69,6 +73,8 @@ bot_help_deposit = "Get your wallet ticker's deposit address."
 bot_help_settings = "settings view and set for prefix, etc. Requires permission manage_channels"
 bot_help_settings_prefix = "Set prefix of CryptoBountyBot in your guild."
 bot_help_coininfo = "List of coin status in CryptoBountyBot."
+bot_help_register = "Register or change your deposit address for CryptoBountyBot."
+bot_help_withdraw = f"Withdraw coin from your CryptoBountyBot balance."
 
 bot_help_admin_shutdown = "Restart bot."
 bot_help_admin_maintenance = "Bot to be in maintenance mode ON / OFF"
@@ -620,13 +626,376 @@ async def deposit(ctx, coin: str, pub: str = None):
         return
     if wallet['balance_wallet_address']:
         await ctx.message.add_reaction(EMOJI_OK_HAND)
+        withdraw_addr = ''
+        if 'user_wallet_address' in wallet and wallet['user_wallet_address']:
+            withdraw_addr = "\n" + EMOJI_MONEYBAG + " Withdraw address: `" + wallet['user_wallet_address'] + "`"
         if show_pub:
             await ctx.send(f'**[{COIN_NAME} DEPOSIT INFO]**\n'
-                                        f'{EMOJI_MONEYBAG} Deposit Address: `' + wallet['balance_wallet_address'] + '`')
+                                        f'{EMOJI_MONEYBAG} Deposit Address: `' + wallet['balance_wallet_address'] + '`'
+                                        f'{withdraw_addr}')
         else:
             await ctx.message.author.send(f'**[{COIN_NAME} DEPOSIT INFO]**\n'
-                                        f'{EMOJI_MONEYBAG} Deposit Address: `' + wallet['balance_wallet_address'] + '`')
+                                        f'{EMOJI_MONEYBAG} Deposit Address: `' + wallet['balance_wallet_address'] + '`'
+                                        f'{withdraw_addr}')
+
     return
+
+
+@bot.command(pass_context=True, name='register', aliases=['reg'], help=bot_help_register)
+async def register(ctx, wallet_address: str):
+    global IS_RESTARTING
+    # check if bot is going to restart
+    if IS_RESTARTING:
+        await ctx.message.add_reaction(EMOJI_REFRESH)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Bot is going to restart soon. Wait until it is back for using this.')
+        return
+
+    if wallet_address.isalnum() == False:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Invalid address:\n'
+                       f'`{wallet_address}`')
+        return
+
+    COIN_NAME = get_cn_coin_from_address(wallet_address)
+    if COIN_NAME:
+        pass
+    else:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Unknown Ticker.')
+        return
+
+    coin_family = getattr(getattr(config,"coin"+COIN_NAME),"coin_family","TRTL")
+
+    if is_maintenance_coin(COIN_NAME):
+        await ctx.message.add_reaction(EMOJI_MAINTENANCE)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} {COIN_NAME} in maintenance.')
+        return
+
+    if coin_family == "TRTL" or coin_family == "XMR":
+        main_address = getattr(getattr(config,"coin"+COIN_NAME),"MainAddress")
+        if wallet_address == main_address:
+            await ctx.message.add_reaction(EMOJI_QUESTEXCLAIM)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} {COIN_NAME} do not register with main address. You could lose your coin when withdraw.')
+            return
+
+    user = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+    if user is None:
+        userregister = await store.sql_register_user(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+        user = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+
+    existing_user = user
+
+    valid_address = None
+    if COIN_NAME in ["BTC", "LTC", "DOGE"]:
+        user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+        if user_from is None:
+            user_from = await store.sql_register_user(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+            user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+        user_from['address'] = user_from['balance_wallet_address']
+
+        valid_address = await doge_validaddress(str(wallet_address), COIN_NAME)
+        if ('isvalid' in valid_address):
+            if str(valid_address['isvalid']) == "True":
+                valid_address = wallet_address
+            else:
+                valid_address = None
+            pass
+        pass
+    elif COIN_NAME in ["WRKZ"]:
+        valid_address = addressvalidation.validate_address_cn(wallet_address, COIN_NAME)
+    elif COIN_NAME in ["XMR"]:
+        valid_address = await validate_address_xmr(str(wallet_address), COIN_NAME)
+        if valid_address is None:
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Invalid address:\n'
+                           f'`{wallet_address}`')
+        if valid_address['valid'] == True and valid_address['integrated'] == False \
+        and valid_address['subaddress'] == False and valid_address['nettype'] == 'mainnet':
+            # re-value valid_address
+            valid_address = str(wallet_address)
+        else:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Please use {COIN_NAME} main address.')
+            return
+    else:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Unknown Ticker.')
+        return
+    # correct print(valid_address)
+    if valid_address is None:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Invalid {COIN_NAME} address:\n'
+                       f'`{wallet_address}`')
+        return
+
+    if valid_address != wallet_address:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Invalid {COIN_NAME} address:\n'
+                       f'`{wallet_address}`')
+        return
+
+    # if they want to register with tipjar address
+    try:
+        if user['balance_wallet_address'] == wallet_address:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You can not register with your {COIN_NAME} tipjar\'s address.\n'
+                           f'`{wallet_address}`')
+            return
+        else:
+            pass
+    except Exception as e:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        print('Error during register user address:' + str(e))
+        return
+
+    server_prefix = await get_guild_prefix(ctx)
+    if 'user_wallet_address' in existing_user and existing_user['user_wallet_address']:
+        prev_address = existing_user['user_wallet_address']
+        if prev_address != valid_address:
+            await store.sql_update_user(str(ctx.message.author.id), wallet_address, COIN_NAME)
+            await ctx.message.add_reaction(EMOJI_OK_HAND)
+            await ctx.send(f'Your {COIN_NAME} {ctx.author.mention} withdraw address has changed from:\n'
+                           f'`{prev_address}`\n to\n '
+                           f'`{wallet_address}`')
+            return
+        else:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{ctx.author.mention} Your {COIN_NAME} previous and new address is the same.')
+            return
+    else:
+        await store.sql_update_user(str(ctx.message.author.id), wallet_address, COIN_NAME)
+        await ctx.message.add_reaction(EMOJI_OK_HAND)
+        await ctx.send(f'{ctx.author.mention} You have registered {COIN_NAME} withdraw address.\n'
+                       f'You can use `{server_prefix}withdraw AMOUNT {COIN_NAME}` anytime.')
+        return
+
+
+@bot.command(pass_context=True, help=bot_help_withdraw)
+async def withdraw(ctx, amount: str, coin: str):
+    global WITHDRAW_IN_PROCESS, IS_RESTARTING
+    # check if bot is going to restart
+    if IS_RESTARTING:
+        await ctx.message.add_reaction(EMOJI_REFRESH)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Bot is going to restart soon. Wait until it is back for using this.')
+        return
+
+    botLogChan = bot.get_channel(id=config.discord.logChan)
+    amount = amount.replace(",", "")
+
+    try:
+        amount = float(amount)
+    except ValueError:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Invalid given amount for command withdraw.')
+        return
+
+    COIN_NAME = coin.upper()
+
+    if COIN_NAME not in ENABLE_COIN:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Unknown Ticker.')
+        return
+
+    if not is_withdrawable_coin(COIN_NAME):
+        msg = await ctx.send(f'{EMOJI_ERROR} {ctx.author.mention} **WITHDRAW** is currently disable for {COIN_NAME}.')
+        await msg.add_reaction(EMOJI_OK_BOX)
+        return
+
+    coin_family = getattr(getattr(config,"coin"+COIN_NAME),"coin_family","TRTL")
+    if is_maintenance_coin(COIN_NAME):
+        await ctx.message.add_reaction(EMOJI_MAINTENANCE)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} {COIN_NAME} in maintenance.')
+        return
+
+    # add redis action
+    random_string = str(uuid.uuid4())
+    await add_tx_action_redis(json.dumps([random_string, "WITHDRAW", str(ctx.message.author.id), ctx.message.author.name, float("%.3f" % time.time()), ctx.message.content, "DISCORD", "START"]), False)
+
+    server_prefix = await get_guild_prefix(ctx)
+    COIN_DEC = get_decimal(COIN_NAME)
+    MinTx = get_min_tx_amount(COIN_NAME)
+    MaxTX = get_max_tx_amount(COIN_NAME)
+    real_amount = int(amount * COIN_DEC) if (coin_family == "TRTL" or coin_family == "XMR") else amount
+    NetFee = get_reserved_fee(COIN_NAME)
+
+    user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+    if user_from is None:
+        user_from = await store.sql_register_user(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+        user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+
+    CoinAddress = None
+    if user_from['user_wallet_address'] is None:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You do not have a withdrawal address, please use '
+                       f'`{server_prefix}register wallet_address` to register.')
+        return
+    else:
+        CoinAddress = user_from['user_wallet_address']
+
+    if coin_family == "TRTL":
+        # Check available balance
+        userdata_balance = store.sql_user_balance(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+        user_from['actual_balance'] = user_from['actual_balance'] + float(userdata_balance['Adjust'])
+
+        if real_amount + NetFee > user_from['actual_balance']:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Insufficient reserved fee to withdraw '
+                           f'{num_format_coin(real_amount, COIN_NAME)} '
+                           f'{COIN_NAME} to {CoinAddress}.')
+
+            return
+
+        if real_amount > MaxTX:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Transactions cannot be bigger than '
+                           f'{num_format_coin(MaxTX, COIN_NAME)} '
+                           f'{COIN_NAME}.')
+            return
+        elif real_amount < MinTx:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Transactions cannot be smaller than '
+                           f'{num_format_coin(MinTx, COIN_NAME)} '
+                           f'{COIN_NAME}.')
+
+            return
+
+        sending = None
+        if ctx.message.author.id not in WITHDRAW_IN_PROCESS:
+            WITHDRAW_IN_PROCESS.append(ctx.message.author.id)
+            try:
+                sending = await store.sql_external_cn_xmr_single('DISCORD', str(ctx.message.author.id), real_amount, CoinAddress, COIN_NAME)
+                tip_tx_tipper = "Transaction hash: `{}`".format(sending['transactionHash'])
+                tip_tx_tipper += "\nTx Fee: `{}{}`".format(num_format_coin(sending['fee'], COIN_NAME), COIN_NAME)
+                await add_tx_action_redis(json.dumps([random_string, "WITHDRAW", str(ctx.message.author.id), ctx.message.author.name, float("%.3f" % time.time()), ctx.message.content, "DISCORD", "COMPLETE"]), False)
+            except Exception as e:
+                traceback.print_exc(file=sys.stdout)
+            WITHDRAW_IN_PROCESS.remove(ctx.message.author.id)
+        if sending:
+            await ctx.message.add_reaction(EMOJI_OK_BOX)
+            await ctx.message.author.send(f'{EMOJI_ARROW_RIGHTHOOK} You have withdrawn {num_format_coin(real_amount, COIN_NAME)} '
+                                          f'{COIN_NAME} '
+                                          f'to `{CoinAddress}`\n'
+                                          f'{tip_tx_tipper}')
+            return
+        else:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{ctx.author.mention} Can not deliver TX for {COIN_NAME} right now. Try again soon.')
+            return
+    elif coin_family == "XMR":
+        user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+        userdata_balance = store.sql_user_balance(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+
+        # If balance 0, no need to check anything
+        if float(user_from['actual_balance']) + float(userdata_balance['Adjust']) <= 0:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Please check your **{COIN_NAME}** balance.')
+            return
+        if real_amount > float(user_from['actual_balance']) + float(userdata_balance['Adjust']):
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Insufficient balance to send out '
+                           f'{num_format_coin(real_amount, COIN_NAME)} '
+                           f'{COIN_NAME}.')
+            return
+
+        NetFee = await get_tx_fee_xmr(coin = COIN_NAME, amount = real_amount, to_address = CoinAddress)
+        if NetFee is None:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Can not get fee from network for: '
+                           f'{num_format_coin(real_amount, COIN_NAME)} '
+                           f'{COIN_NAME}. Please try again later in a few minutes.')
+            return
+        if real_amount + NetFee > float(user_from['actual_balance']) + float(userdata_balance['Adjust']):
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Insufficient balance to send out '
+                           f'{num_format_coin(real_amount, COIN_NAME)} '
+                           f'{COIN_NAME}. You need to leave at least network fee: {num_format_coin(NetFee, COIN_NAME)}{COIN_NAME}')
+            return
+        if real_amount < MinTx:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Transaction cannot be smaller than '
+                           f'{num_format_coin(MinTx, COIN_NAME)} '
+                           f'{COIN_NAME}.')
+            return
+        if real_amount > MaxTX:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Transaction cannot be bigger than '
+                           f'{num_format_coin(MaxTX, COIN_NAME)} '
+                           f'{COIN_NAME}.')
+            return
+
+        SendTx = None
+        if ctx.message.author.id not in WITHDRAW_IN_PROCESS:
+            WITHDRAW_IN_PROCESS.append(ctx.message.author.id)
+            try:
+                SendTx = await store.sql_external_cn_xmr_single('DISCORD', str(ctx.message.author.id), real_amount,
+                                                                CoinAddress, COIN_NAME)
+                await add_tx_action_redis(json.dumps([random_string, "WITHDRAW", str(ctx.message.author.id), ctx.message.author.name, float("%.3f" % time.time()), ctx.message.content, "DISCORD", "COMPLETE"]), False)
+            except Exception as e:
+                traceback.print_exc(file=sys.stdout)
+            WITHDRAW_IN_PROCESS.remove(ctx.message.author.id)
+        else:
+            # reject and tell to wait
+            msg = await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You have another tx in process. Please wait it to finish. ')
+            
+            return
+        if SendTx:
+            SendTx_hash = SendTx['tx_hash']
+            await ctx.message.add_reaction(EMOJI_OK_BOX)
+            await ctx.message.author.send(f'{EMOJI_ARROW_RIGHTHOOK} You have withdrawn {num_format_coin(real_amount, COIN_NAME)} '
+                                          f'{COIN_NAME} to `{CoinAddress}`.\n'
+                                          f'Transaction hash: `{SendTx_hash}`\n'
+                                          'Network fee deducted from your account balance.')
+            return
+        else:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            return
+        return
+    elif coin_family == "DOGE":
+        user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+        userdata_balance = store.sql_user_balance(str(ctx.message.author.id), COIN_NAME, 'DISCORD')        
+
+        real_amount = float(amount)
+        userdata_balance = store.sql_user_balance(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+        if real_amount + NetFee > float(user_from['actual_balance']) + float(userdata_balance['Adjust']):
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Insufficient balance to send out '
+                           f'{num_format_coin(real_amount, COIN_NAME)} '
+                           f'{COIN_NAME}.')
+            return
+        if real_amount < MinTx:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Transaction cannot be smaller than '
+                           f'{num_format_coin(MinTx, COIN_NAME)} '
+                           f'{COIN_NAME}.')
+            return
+        if real_amount > MaxTX:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Transaction cannot be bigger than '
+                           f'{num_format_coin(MaxTX, COIN_NAME)} '
+                           f'{COIN_NAME}.')
+            return
+        SendTx = None
+        if ctx.message.author.id not in WITHDRAW_IN_PROCESS:
+            WITHDRAW_IN_PROCESS.append(ctx.message.author.id)
+            try:
+                SendTx = await store.sql_external_doge('DISCORD', str(ctx.message.author.id), real_amount, NetFee,
+                                                       CoinAddress, COIN_NAME)
+                await add_tx_action_redis(json.dumps([random_string, "WITHDRAW", str(ctx.message.author.id), ctx.message.author.name, float("%.3f" % time.time()), ctx.message.content, "DISCORD", "COMPLETE"]), False)
+            except Exception as e:
+                traceback.print_exc(file=sys.stdout)
+            WITHDRAW_IN_PROCESS.remove(ctx.message.author.id)
+        else:
+            msg = await ctx.send(f'{EMOJI_ERROR} {ctx.author.mention} You have another tx in progress.')
+            await msg.add_reaction(EMOJI_OK_BOX)
+            return
+        if SendTx:
+            await ctx.message.author.send(f'{EMOJI_ARROW_RIGHTHOOK} You have withdrawn {num_format_coin(real_amount, COIN_NAME)} '
+                                          f'{COIN_NAME} to `{CoinAddress}`.\n'
+                                          f'Transaction hash: `{SendTx}`\n'
+                                          'Network fee deducted from the amount.')
+            return
+        else:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            return
 
 
 # Let's run balance update by a separate process
@@ -892,6 +1261,50 @@ async def get_guild_prefix(ctx):
         return "."
     else:
         return serverinfo['prefix']
+
+
+def get_cn_coin_from_address(CoinAddress: str):
+    COIN_NAME = None
+    if CoinAddress.startswith("Wrkz"):
+        COIN_NAME = "WRKZ"
+    elif (CoinAddress.startswith("4") or CoinAddress.startswith("8") or CoinAddress.startswith("5") or CoinAddress.startswith("9")) \
+        and (len(CoinAddress) == 95 or len(CoinAddress) == 106):
+        addr = None
+        # Try XMR
+        try:
+            addr = address_xmr(CoinAddress)
+            COIN_NAME = "XMR"
+            return COIN_NAME
+        except Exception as e:
+            # traceback.print_exc(file=sys.stdout)
+            pass
+    elif CoinAddress.startswith("D") and len(CoinAddress) == 34:
+        COIN_NAME = "DOGE"
+    elif (CoinAddress[0] in ["M", "L"]) and len(CoinAddress) == 34:
+        COIN_NAME = "LTC"
+    elif (CoinAddress[0] in ["3", "1"]) and len(CoinAddress) == 34:
+        COIN_NAME = "BTC"
+    print('CryptoBountyBot get_cn_coin_from_address return {}: {}'.format(CoinAddress, COIN_NAME))
+    return COIN_NAME
+
+
+@register.error
+async def register_error(ctx, error):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing your wallet address. '
+                       f'You need to have a supported coin **address** after `register` command. Example: {prefix}register coin_address')
+    return
+
+
+@withdraw.error
+async def withdraw_error(ctx, error):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing amount and/or ticker. '
+                       f'You need to tell me **AMOUNT** and/or **TICKER**.\nExample: {prefix}withdraw **1,000 coin_name**')
+    return
 
 
 @click.command()

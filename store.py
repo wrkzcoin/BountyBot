@@ -170,6 +170,34 @@ async def sql_get_userwallet(userID, coin: str, user_server: str = 'DISCORD'):
         traceback.print_exc(file=sys.stdout)
 
 
+async def sql_update_user(userID, user_wallet_address, coin: str, user_server: str = 'DISCORD'):
+    global redis_conn
+    COIN_NAME = coin.upper()
+    user_server = user_server.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    coin_family = getattr(getattr(config,"coin"+COIN_NAME),"coin_family","TRTL")
+    global conn
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            if coin_family == "TRTL":
+                sql = """ UPDATE cn_user_paymentid SET user_wallet_address=%s WHERE user_id=%s AND `coin_name` = %s AND `user_server`=%s LIMIT 1 """               
+                cur.execute(sql, (user_wallet_address, str(userID), COIN_NAME, user_server))
+                conn.commit()
+            elif coin_family == "XMR":
+                sql = """ UPDATE xmr_user_paymentid SET user_wallet_address=%s WHERE `user_id`=%s AND `coin_name` = %s AND `user_server`=%s LIMIT 1 """               
+                cur.execute(sql, (user_wallet_address, str(userID), COIN_NAME, user_server))
+                conn.commit()
+            elif coin_family == "DOGE":
+                sql = """ UPDATE doge_user SET user_wallet_address=%s WHERE `user_id`=%s AND `coin_name` = %s AND `user_server`=%s LIMIT 1 """               
+                cur.execute(sql, (user_wallet_address, str(userID), COIN_NAME, user_server))
+                conn.commit()
+            return user_wallet_address  # return userwallet
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+
+
 async def sql_update_balances(coin: str):
     global conn, redis_conn, redis_expired, XS_COIN
     updateTime = int(time.time())
@@ -539,7 +567,7 @@ async def sql_external_cn_xmr_single(user_server: str, user_from: str, amount: f
         openConnection()
         tx_hash = None
         if coin_family == "XMR":
-            tx_hash = await wallet.send_transaction('TIPBOT', to_address, 
+            tx_hash = await wallet.send_transaction('BOUNTYBOT', to_address, 
                                                     amount, COIN_NAME, 0)
             if tx_hash:
                 with conn.cursor() as cur: 
@@ -550,57 +578,33 @@ async def sql_external_cn_xmr_single(user_server: str, user_from: str, amount: f
                     int(time.time()), tx_hash['tx_hash'], tx_hash['tx_key'], user_server))
                     conn.commit()
             return tx_hash
-        elif (coin_family == "TRTL" or coin_family == "CCX") and (COIN_NAME not in XS_COIN):
+        elif coin_family == "TRTL"and COIN_NAME not in XS_COIN:
             from_address = wallet.get_main_address(COIN_NAME)
-            if paymentid is None:
-                tx_hash = await walletapi.walletapi_send_transaction(from_address, to_address, 
-                                                                     amount, COIN_NAME)
-                if tx_hash:
-                    with conn.cursor() as cur: 
-                        sql = """ INSERT INTO cn_external_tx (`coin_name`, `user_id`, `amount`, `fee`, `decimal`, `to_address`, 
-                                  `date`, `tx_hash`, `user_server`) 
-                                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) """
-                        cur.execute(sql, (COIN_NAME, user_from, amount, tx_hash['fee'], wallet.get_decimal(COIN_NAME), to_address, 
-                        int(time.time()), tx_hash['transactionHash'], user_server))
-                        conn.commit()
-            else:
-                tx_hash = await walletapi.walletapi_send_transaction_id(from_address, to_address, 
-                                                                        amount, paymentid, COIN_NAME)
-                if tx_hash:
-                    with conn.cursor() as cur: 
-                        sql = """ INSERT INTO cn_external_tx (`coin_name`, `user_id`, `amount`, `fee`, `decimal`, `to_address`, 
-                                  `date`, `tx_hash`, `user_server`) 
-                                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) """
-                        cur.execute(sql, (COIN_NAME, user_from, amount, tx_hash['fee'], wallet.get_decimal(COIN_NAME), to_address, 
-                        int(time.time()), tx_hash['transactionHash'], user_server))
-                        conn.commit()
+            tx_hash = await walletapi.walletapi_send_transaction(from_address, to_address, 
+                                                                 amount, COIN_NAME)
+            if tx_hash:
+                with conn.cursor() as cur: 
+                    sql = """ INSERT INTO cn_external_tx (`coin_name`, `user_id`, `amount`, `fee`, `decimal`, `to_address`, 
+                              `date`, `tx_hash`, `user_server`) 
+                              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) """
+                    cur.execute(sql, (COIN_NAME, user_from, amount, tx_hash['fee'], wallet.get_decimal(COIN_NAME), to_address, 
+                                int(time.time()), tx_hash['transactionHash'], user_server))
+                    conn.commit()
             return tx_hash
-        elif (coin_family == "TRTL" or coin_family == "CCX") and (COIN_NAME in XS_COIN):
+        elif coin_family == "TRTL" and COIN_NAME in XS_COIN:
             # TODO: check fee
             from_address = wallet.get_main_address(COIN_NAME)
             tx_fee = wallet.get_tx_fee(COIN_NAME)
-            if paymentid is None:
-                tx_hash = await wallet.send_transaction(from_address, to_address, 
-                                                        amount, COIN_NAME)
-                if tx_hash:
-                    with conn.cursor() as cur: 
-                        sql = """ INSERT INTO cn_external_tx (`coin_name`, `user_id`, `amount`, `fee`, `decimal`, `to_address`, 
-                                  `date`, `tx_hash`, `user_server`) 
-                                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) """
-                        cur.execute(sql, (COIN_NAME, user_from, amount, tx_fee, wallet.get_decimal(COIN_NAME), to_address, 
-                        int(time.time()), tx_hash['transactionHash'], user_server))
-                        conn.commit()
-            else:
-                tx_hash = await wallet.send_transaction_id(from_address, to_address, 
-                                                           amount, paymentid, COIN_NAME)
-                if tx_hash:
-                    with conn.cursor() as cur: 
-                        sql = """ INSERT INTO cn_external_tx (`coin_name`, `user_id`, `amount`, `fee`, `decimal`, `to_address`, 
-                                  `date`, `tx_hash`, `user_server`) 
-                                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) """
-                        cur.execute(sql, (COIN_NAME, user_from, amount, tx_fee, wallet.get_decimal(COIN_NAME), to_address, 
-                        int(time.time()), tx_hash['transactionHash'], user_server))
-                        conn.commit()
+            tx_hash = await wallet.send_transaction(from_address, to_address, 
+                                                    amount, COIN_NAME)
+            if tx_hash:
+                with conn.cursor() as cur: 
+                    sql = """ INSERT INTO cn_external_tx (`coin_name`, `user_id`, `amount`, `fee`, `decimal`, `to_address`, 
+                              `date`, `tx_hash`, `user_server`) 
+                              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) """
+                    cur.execute(sql, (COIN_NAME, user_from, amount, tx_fee, wallet.get_decimal(COIN_NAME), to_address, 
+                                int(time.time()), tx_hash['transactionHash'], user_server))
+                    conn.commit()
             return tx_hash
     except Exception as e:
         traceback.print_exc(file=sys.stdout)
