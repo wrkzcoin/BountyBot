@@ -701,7 +701,7 @@ async def register(ctx, wallet_address: str):
                 valid_address = None
             pass
         pass
-    elif COIN_NAME in ["WRKZ"]:
+    elif COIN_NAME in ["WRKZ", "DEGO"]:
         valid_address = addressvalidation.validate_address_cn(wallet_address, COIN_NAME)
     elif COIN_NAME in ["XMR"]:
         valid_address = await validate_address_xmr(str(wallet_address), COIN_NAME)
@@ -1003,7 +1003,7 @@ async def update_balance():
     INTERVAL_EACH = 10
     while True:
         print('sleep in second: '+str(INTERVAL_EACH))
-        for coinItem in ["BTC", "DOGE", "LTC", "WRKZ", "XMR"]:
+        for coinItem in ["BTC", "DOGE", "LTC", "WRKZ", "DEGO", "XMR"]:
             await asyncio.sleep(INTERVAL_EACH)
             print('Update balance: '+ coinItem)
             start = time.time()
@@ -1267,6 +1267,8 @@ def get_cn_coin_from_address(CoinAddress: str):
     COIN_NAME = None
     if CoinAddress.startswith("Wrkz"):
         COIN_NAME = "WRKZ"
+    elif CoinAddress.startswith("dg"):
+        COIN_NAME = "DEGO"
     elif (CoinAddress.startswith("4") or CoinAddress.startswith("8") or CoinAddress.startswith("5") or CoinAddress.startswith("9")) \
         and (len(CoinAddress) == 95 or len(CoinAddress) == 106):
         addr = None
