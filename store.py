@@ -790,7 +790,7 @@ def sql_addinfo_by_server(server_id: str, servername: str, prefix: str, rejoin: 
                 conn.commit()
             else:
                 sql = """ INSERT INTO `discord_server` (`serverid`, `servername`, `prefix`)
-                          VALUES (%s, %s, %) ON DUPLICATE KEY UPDATE 
+                          VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE 
                           `servername` = %s, `prefix` = %s"""
                 cur.execute(sql, (server_id, servername[:28], prefix, servername[:28], prefix))
                 conn.commit()
@@ -809,3 +809,262 @@ def sql_changeinfo_by_server(server_id: str, what: str, value: str):
                 conn.commit()
         except Exception as e:
             traceback.print_exc(file=sys.stdout)
+
+
+def sql_bounty_add_data(coin_name: str, ref_id: str, bounty_amount: float, bounty_amount_after_fee: float, bounty_coin_decimal: int, 
+    userid_create: str, bounty_title: str, bounty_obj: str, bounty_desc: str, bounty_type: str, 
+    status: str, created_user_server: str='DISCORD'):
+    global conn
+    user_server = created_user_server.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            sql = """ INSERT INTO `bounty_data` (`ref_id`, `bounty_amount`, `bounty_amount_after_fee`, `bounty_coin_decimal`, 
+                      `userid_create`, `created_date`, `bounty_title`, `bounty_obj`, `bounty_desc`, `bounty_type`, `status`, 
+                      `created_user_server`, `coin_name`)
+                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) """
+            cur.execute(sql, (ref_id, bounty_amount, bounty_amount_after_fee, bounty_coin_decimal, userid_create,
+                              int(time.time()), bounty_title, bounty_obj, bounty_desc, bounty_type, status, user_server, coin_name))
+            conn.commit()
+            return True
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+    return False
+
+
+def sql_bounty_list_of_user(userid: str, status:str, created_user_server: str='DISCORD', limit: int=100):
+    user_server = created_user_server.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    status = status.upper()
+    if status not in ['COMPLETED','OPENED','ONGOING','CANCELLED', 'ALL']:
+        return
+    global conn
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            if status != 'ALL':
+                if userid == 'ALL':
+                    sql = """ SELECT * FROM bounty_data WHERE `status` = %s AND `created_user_server`=%s 
+                              ORDER BY `created_date` DESC LIMIT """+str(limit)+""" """
+                    cur.execute(sql, (status, user_server))
+                    result = cur.fetchall()
+                    return result
+                else:
+                    sql = """ SELECT * FROM bounty_data WHERE `status` = %s AND `created_user_server`=%s AND `userid_create`=%s 
+                              ORDER BY `created_date` DESC LIMIT """+str(limit)+""" """
+                    cur.execute(sql, (status, user_server, userid))
+                    result = cur.fetchall()
+                    return result
+            else:
+                if userid == 'ALL':
+                    sql = """ SELECT * FROM bounty_data WHERE `created_user_server`=%s 
+                              ORDER BY `created_date` DESC LIMIT """+str(limit)+""" """
+                    cur.execute(sql, (user_server))
+                    result = cur.fetchall()
+                    return result
+                else:
+                    sql = """ SELECT * FROM bounty_data WHERE `created_user_server`=%s AND `userid_create`=%s 
+                              ORDER BY `created_date` DESC LIMIT """+str(limit)+""" """
+                    cur.execute(sql, (user_server, userid))
+                    result = cur.fetchall()
+                    return result
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+    return None
+
+
+def sql_bounty_get_ref(ref: str, created_user_server: str='DISCORD'):
+    user_server = created_user_server.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    global conn
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            sql = """ SELECT * FROM bounty_data WHERE `ref_id` = %s AND `created_user_server`=%s LIMIT 1 """
+            cur.execute(sql, (ref, user_server))
+            result = cur.fetchone()
+            return result
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+    return None
+
+
+def sql_bounty_update_by_ref(ref: str, what: str, value: str, created_user_server: str='DISCORD'):
+    user_server = created_user_server.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    if what not in ["bounty_title", "bounty_obj", "bounty_desc", "status", "amount"]:
+        return
+    if what.lower() == "amount":
+        # TODO get amount string to list
+        amount_data = json.loads(value)
+    global conn
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            if what.lower() == "amount":
+                sql = """ UPDATE bounty_data SET `coin_name` = %s, `bounty_amount`=%s, `bounty_amount_after_fee`=%s, 
+                          `bounty_coin_decimal`=%s, `updated_date`=%s 
+                          WHERE `ref_id` = %s AND `created_user_server`=%s """
+                cur.execute(sql, (amount_data['coin_name'], amount_data['bounty_amount'], 
+                                  amount_data['bounty_amount_after_fee'], amount_data['bounty_coin_decimal'], 
+                                  int(time.time()), ref, user_server))
+                conn.commit()
+                return True
+            else:
+                sql = """ UPDATE bounty_data SET `""" + what.lower() + """` = %s, `updated_date`=%s 
+                          WHERE `ref_id` = %s AND `created_user_server`=%s """
+                cur.execute(sql, (value, int(time.time()), ref, user_server))
+                conn.commit()
+                return True
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+    return None
+
+
+def sql_bounty_list_of_user_apply(userid: str, bounty_ref_id:str, created_user_server: str='DISCORD', status:str='APPLIED', limit: int=100):
+    user_server = created_user_server.upper()
+    status = status.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    bounty_ref_id = bounty_ref_id.upper()
+    global conn
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            if userid != 'ALL' and bounty_ref_id == 'ALL':
+                # select all applied by a user.
+                sql = """ SELECT * FROM bounty_apply WHERE `applied_userid` = %s AND `created_user_server`=%s 
+                          AND `status`=%s ORDER BY `applied_date` DESC LIMIT """+str(limit)+""" """
+                cur.execute(sql, (userid, user_server, status))
+                result = cur.fetchall()
+                return result
+            elif userid != 'ALL' and bounty_ref_id != 'ALL':
+                # select an application by a user if exists
+                sql = """ SELECT * FROM bounty_apply WHERE `applied_userid` = %s AND `created_user_server`=%s 
+                          AND `status`=%s AND `bounty_ref_id`=%s LIMIT 1 """
+                cur.execute(sql, (userid, user_server, status, bounty_ref_id))
+                result = cur.fetchone()
+                return result
+            elif userid == 'ALL' and bounty_ref_id != 'ALL':
+                # select all applicant for a bounty
+                sql = """ SELECT * FROM bounty_apply WHERE `status`=%s 
+                          AND `bounty_ref_id`=% ORDER BY `applied_date` DESC LIMIT """+str(limit)+""" """
+                cur.execute(sql, (status, bounty_ref_id))
+                result = cur.fetchall()
+                return result
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+    return None
+
+
+def sql_bounty_add_apply(coin_name: str, applied_id: str, applied_userid: str, bounty_ref_id: str, userid_create: str, bounty_amount: float, 
+    bounty_amount_after_fee: float, bounty_coin_decimal: int, status: str, created_user_server: str='DISCORD'):
+    global conn
+    user_server = created_user_server.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    status = status.upper()
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            sql = """ INSERT INTO `bounty_apply` (`applied_id`, `applied_userid`, `applied_date`, `bounty_ref_id`, 
+                      `userid_create`, `bounty_amount`, `bounty_amount_after_fee`, `bounty_coin_decimal`, 
+                      `status`, `created_user_server`, `coin_name`)
+                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) """
+            cur.execute(sql, (applied_id, applied_userid, int(time.time()), bounty_ref_id, userid_create,
+                              bounty_amount, bounty_amount_after_fee, bounty_coin_decimal, status, user_server, coin_name))
+            conn.commit()
+            return True
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+    return False
+
+def sql_bounty_list_of_apply(userid: str, status:str, created_user_server: str='DISCORD', limit: int=100):
+    user_server = created_user_server.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    status = status.upper()
+    if status not in ['ACCEPTED','REJECTED','APPLIED','COMPLETED','CANCELLED', 'ALL']:
+        return
+    global conn
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            if status != 'ALL':
+                if userid == 'ALL':
+                    sql = """ SELECT * FROM bounty_apply WHERE `status` = %s AND `created_user_server`=%s 
+                              ORDER BY `applied_date` DESC LIMIT """+str(limit)+""" """
+                    cur.execute(sql, (status, user_server))
+                    result = cur.fetchall()
+                    return result
+                else:
+                    sql = """ SELECT * FROM bounty_apply WHERE `status` = %s AND `created_user_server`=%s AND `applied_userid`=%s 
+                              ORDER BY `applied_date` DESC LIMIT """+str(limit)+""" """
+                    cur.execute(sql, (status, user_server, userid))
+                    result = cur.fetchall()
+                    return result
+            else:
+                if userid == 'ALL':
+                    sql = """ SELECT * FROM bounty_apply WHERE `created_user_server`=%s 
+                              ORDER BY `applied_date` DESC LIMIT """+str(limit)+""" """
+                    cur.execute(sql, (user_server))
+                    result = cur.fetchall()
+                    return result
+                else:
+                    sql = """ SELECT * FROM bounty_apply WHERE `created_user_server`=%s AND `applied_userid`=%s 
+                              ORDER BY `applied_date` DESC LIMIT """+str(limit)+""" """
+                    cur.execute(sql, (user_server, userid))
+                    result = cur.fetchall()
+                    return result
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+    return None
+
+
+def sql_bounty_get_apply_by_ref(userid: str, ref: str, created_user_server: str='DISCORD'):
+    user_server = created_user_server.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    global conn
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            if userid == 'ALL':
+                sql = """ SELECT * FROM bounty_apply WHERE `bounty_ref_id` = %s  
+                          ORDER BY `applied_date` DESC """
+                cur.execute(sql, (ref))
+                result = cur.fetchall()
+                return result
+            else:
+                sql = """ SELECT * FROM bounty_apply WHERE `bounty_ref_id` = %s AND `created_user_server`=%s AND `applied_userid`=%s LIMIT 1 """
+                cur.execute(sql, (ref, user_server, userid))
+                result = cur.fetchone()
+                return result
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+    return None
+
+
+def sql_bounty_update_apply_by_ref(ref: str, userid: str, what: str, value: str, created_user_server: str='DISCORD'):
+    user_server = created_user_server.upper()
+    if user_server not in ['DISCORD', 'TELEGRAM']:
+        return
+    if what not in [ "status"]:
+        return
+    global conn
+    try:
+        openConnection()
+        with conn.cursor() as cur:
+            sql = """ UPDATE bounty_apply SET `""" + what.lower() + """` = %s, `updated_date`=%s 
+                      WHERE `bounty_ref_id` = %s AND `applied_userid`=%s AND `created_user_server`=%s """
+            cur.execute(sql, (value, int(time.time()), ref, userid, user_server))
+            conn.commit()
+            return True
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+    return None

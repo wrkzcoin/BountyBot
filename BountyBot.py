@@ -24,13 +24,20 @@ from generic_xmr.address_xmr import address_xmr as address_xmr
 import pymysql, pymysqlpool
 import pymysql.cursors
 
+# ascii table
+from terminaltables import AsciiTable
 
 from typing import List, Dict
+
+# for randomString
+import random
+import string
 
 # Coin using wallet-api
 ENABLE_COIN = config.Enable_Coin.split(",")
 ENABLE_XMR = config.Enable_Coin_XMR.split(",")
 WITHDRAW_IN_PROCESS = []
+QUEUE_ADD_LIST = []
 
 redis_pool = None
 redis_conn = None
@@ -46,6 +53,35 @@ EMOJI_OK_HAND = "\U0001F44D"
 EMOJI_MONEYBAG = "\U0001F4B0"
 EMOJI_QUESTEXCLAIM = "\u2049"
 EMOJI_ARROW_RIGHTHOOK = "\u21AA"
+EMOJI_THUMB_UP = "\U0001F44D"
+EMOJI_THUMB_DOWN = "\U0001F44E"
+
+EMOJI_INFINITY = "\u267E"
+EMOJI_RAISEHAND = "\U0001F64B"
+EMOJI_HANDFINGERS = "\U0001F590"
+
+EMOJI_MEMO = "\U0001F4DD"
+EMOJI_GREENAPPLE = "\U0001F34F"
+EMOJI_PINEAPPLE = "\U0001F34D"
+EMOJI_TARGET = "\U0001F3AF"
+
+
+NOTICE_START = """
+```
+By creating a bountry, you will need to accept the following term:\n
+1) Upon bounty submitted, a non-refundable fee of """+ num_format_coin(config.charge_wrkz.creating, "WRKZ")+"""WRKZ will apply
+
+2) Maintenance fee """+"{0:.0%}".format(config.Bounty_Fee_Margin)+""" for each bounty completed
+
+3) Bot shall notify you in case of bounty application, submission of completion to where you created
+
+4) Once you command a bounty as "complete", bounty taker will receive those reward and not able to refund
+
+5) This CryptoBountyBot is still under testing
+
+* Consider donation via donate command if you like it
+```
+"""
 
 COMMAND_IN_PROGRESS = []
 IS_RESTARTING = False
@@ -74,7 +110,22 @@ bot_help_settings = "settings view and set for prefix, etc. Requires permission 
 bot_help_settings_prefix = "Set prefix of CryptoBountyBot in your guild."
 bot_help_coininfo = "List of coin status in CryptoBountyBot."
 bot_help_register = "Register or change your deposit address for CryptoBountyBot."
-bot_help_withdraw = f"Withdraw coin from your CryptoBountyBot balance."
+bot_help_withdraw = "Withdraw coin from your CryptoBountyBot balance."
+
+bot_help_bounty = "Manage bounty."
+bot_help_bounty_add = "Add or cancel a bounty."
+bot_help_bounty_edit = "Edit a bounty."
+bot_help_bounty_search = "Search active bounties."
+bot_help_bounty_detail = "View a bounty in detail by a ref number."
+bot_help_bounty_apply = "Apply for a bounty by a ref number."
+bot_help_bounty_end = "End a bounty. Possible only if no one is taken yet."
+bot_help_bounty_cancel = "Cancel a progressing a bounty entry."
+bot_help_bounty_cancelapply = "Cancel an application for a bounty. Possible only if Bounty Owner has not accepted application."
+bot_help_bounty_confirm_app = "Accept an application by an application ref number."
+bot_help_bounty_mylist = "List of your active bounties."
+bot_help_bounty_mylist_app = "List all your applied bounties."
+bot_help_bounty_complete = "Mark a bounty as completed. Any active bounty taker will received bounty after this command."
+bot_help_bounty_submit = "Submit a result of a bounty by ref number."
 
 bot_help_admin_shutdown = "Restart bot."
 bot_help_admin_maintenance = "Bot to be in maintenance mode ON / OFF"
@@ -444,6 +495,911 @@ async def prefix(ctx, prefix: str):
             await ctx.send(f'{ctx.author.mention} Prefix changed from `{server_prefix}` to `{prefix}`.')
             return
 
+
+@bot.group(name='bounty', aliases=['btb'], help=bot_help_bounty)
+async def bounty(ctx):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(ctx.channel, discord.DMChannel):
+        await ctx.send('If you run this command loop in DM, the bounty is for globally listed.')
+    if ctx.invoked_subcommand is None:
+        await ctx.send(f'{ctx.author.mention} Invalid bounty command.\n'
+                       f'Please use help of each subcommand. Example: {prefix}help bounty OR {prefix}help bounty subcommand')
+    return
+
+
+@bounty.command(help=bot_help_bounty_add)
+async def add(ctx):
+    global QUEUE_ADD_LIST, redis_pool, redis_conn
+    prefix = await get_guild_prefix(ctx)
+    # Check if user has enough WRKZ
+    COIN_NAME = "WRKZ"
+    user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+    if user_from is None:
+        user_from = await store.sql_register_user(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+        user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+    userdata_balance = store.sql_user_balance(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+    balance_having = user_from['actual_balance'] + float(userdata_balance['Adjust'])
+    need_amount = int(config.charge_wrkz.creating * get_decimal(COIN_NAME))
+    if need_amount > balance_having:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Insufficient {COIN_NAME} balance to register a bounty.\n'
+                       f'Need:     {num_format_coin(need_amount, COIN_NAME)}{COIN_NAME}\n'
+                       f'You have: {num_format_coin(balance_having, COIN_NAME)}{COIN_NAME}\n.'
+                       f'Please deposit **{COIN_NAME}** via `{prefix}deposit {COIN_NAME}`.')
+        return
+    
+    if ctx.message.author.id in QUEUE_ADD_LIST:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} you are still in another progress of adding bounty.\n'
+                       'You can cancel it also by: {prefix}bounty cancel')
+        return
+
+    random_string = randomString(16).upper() # use this as reference
+    try:
+        msg = await ctx.send(f'{ctx.author.mention} You are creating a bounty. Please input or re-act as bot requested.\n'
+                             f'{NOTICE_START}'
+                             f'Re-act: {EMOJI_THUMB_UP} if you agree.')
+        await msg.add_reaction(EMOJI_THUMB_UP)
+
+        def check(reaction, user):
+            return user == ctx.message.author and reaction.message.author == bot.user and reaction.message.id == msg.id and str(reaction.emoji) == EMOJI_THUMB_UP
+        try:
+            reaction, user = await bot.wait_for('reaction_add', timeout=config.Bounty_Setting.default_timeout, check=check)
+        except asyncio.TimeoutError:
+            await ctx.send(f'{ctx.author.mention} too long. We assumed you are {EMOJI_THUMB_DOWN}')
+            return
+        else:
+            await ctx.send(f'{ctx.author.mention} Thank you for {EMOJI_THUMB_UP}. Your ongoing bounty ref_id: **{random_string}**. Let\'s move to next step.')
+            pass
+        # store temporary data and start interactive
+        QUEUE_ADD_LIST.append(ctx.message.author.id)
+        key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":ref_id"
+        redis_conn.set(key, random_string)
+        key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":userid_create"
+        redis_conn.set(key, str(ctx.message.author.id))
+        key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":created_date"
+        redis_conn.set(key, str(int(time.time())))
+        key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":created_user_server"
+        redis_conn.set(key, 'DISCORD')
+        msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                             f'Please type in **amount coin_name** for the bounty price (timeout {config.Bounty_Setting.price_timeout}s):\n'
+                             'Supported coin: {}'.format(", ".join(ENABLE_COIN)))
+
+        amount = None
+        COIN_NAME = None
+        while (amount is None) or (COIN_NAME not in ENABLE_COIN):
+            waiting_pricemsg = None
+            try:
+                waiting_pricemsg = await bot.wait_for('message', timeout=config.Bounty_Setting.price_timeout, check=lambda msg: msg.author == ctx.author)
+            except asyncio.TimeoutError:
+                # Delete redis and remove user from QUEUE
+                delete_queue_going(ctx.message.author.id)
+                await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                               f'{ctx.author.mention} too long. We assumed you are gave up during price input.')
+                return
+            if waiting_pricemsg is None:
+                # Delete redis and remove user from QUEUE
+                delete_queue_going(ctx.message.author.id)
+                await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                               f'{ctx.author.mention} too long. We assumed you are gave up during price input.')
+                return
+            else:
+                msg_content = waiting_pricemsg.content.split(" ")
+                if len(msg_content) != 2:
+                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                    await ctx.send(f'{ctx.author.mention} Please use **amount coin_name**. Example `1,000,000 WRKZ`')
+                else:
+                    amount = msg_content[0]
+                    COIN_NAME = msg_content[1].upper()
+                    if COIN_NAME not in ENABLE_COIN:
+                        accepted_coin = ", ".join(ENABLE_COIN)
+                        await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                        await ctx.send(f'{ctx.author.mention} Please use accepted coin: **{accepted_coin}**.')
+                    else:
+                        amount = amount.replace(",", "")
+                        try:
+                            amount = float(amount)
+                            MinTx = get_min_bounty(COIN_NAME)
+                            MaxTX = get_max_bounty(COIN_NAME)
+                            real_amount = amount*get_decimal(COIN_NAME)
+                            if MinTx <= real_amount <= MaxTX:
+                                # check user balance
+                                user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+                                if user_from is None:
+                                    user_from = await store.sql_register_user(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+                                    user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+                                userdata_balance = store.sql_user_balance(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+                                user_from['actual_balance'] = user_from['actual_balance'] + float(userdata_balance['Adjust'])
+                                if user_from['actual_balance'] < real_amount:
+                                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                    await ctx.send(f'{ctx.author.mention} Insufficient balance to make a bounty of '
+                                                   f'**{num_format_coin(real_amount, COIN_NAME)}{COIN_NAME}**\n'
+                                                   'Try to lower the bounty amount again.')
+                                    amount = None
+                            else:
+                                await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                await ctx.send(f'{ctx.author.mention} Amount input is not between '
+                                               f'{num_format_coin(MinTx, COIN_NAME)}{COIN_NAME}, {num_format_coin(MaxTX, COIN_NAME)}{COIN_NAME}.')
+                                amount = None
+                        except ValueError:
+                            amount = None
+                            await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Invalid amount.')
+        msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                             f'Bounty amount set: **{num_format_coin(real_amount, COIN_NAME)}{COIN_NAME}**\n'
+                             f'Next, please give a title of this bounty (min. {config.Bounty_Setting.title_min}, '
+                             f'max. {config.Bounty_Setting.title_max} chars, timeout {config.Bounty_Setting.title_timeout}s):')
+        key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_amount"
+        redis_conn.set(key, str(real_amount))
+        key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_amount_after_fee"
+        redis_conn.set(key, str(real_amount*(1 - config.Bounty_Fee_Margin)))
+        key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_coin_decimal"
+        redis_conn.set(key, str(get_decimal(COIN_NAME)))
+        # TITLE
+        title = None
+        while title is None:
+            waiting_titlemsg = None
+            try:
+                waiting_titlemsg = await bot.wait_for('message', timeout=config.Bounty_Setting.title_timeout, check=lambda msg: msg.author == ctx.author)
+            except asyncio.TimeoutError:
+                # Delete redis and remove user from QUEUE
+                delete_queue_going(ctx.message.author.id)
+                await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                               f'{ctx.author.mention} too long. We assumed you are gave up during title input.')
+                return
+            if waiting_titlemsg is None:
+                # Delete redis and remove user from QUEUE
+                delete_queue_going(ctx.message.author.id)
+                await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                               f'{ctx.author.mention} too long. We assumed you are gave up during title input.')
+                return
+            else:
+                if config.Bounty_Setting.title_min <= len(waiting_titlemsg.content) <= config.Bounty_Setting.title_max:
+                    title = waiting_titlemsg.content.strip()
+                    key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_title"
+                    redis_conn.set(key, title)
+                    msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                         f'Bounty title set: **{title}**\n'
+                                         f'Next, please give a objective of this bounty (min. {config.Bounty_Setting.obj_min}, '
+                                         f'max. {config.Bounty_Setting.obj_max} chars, timeout {config.Bounty_Setting.obj_timeout}s):')
+                else:
+                    title = None
+                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                    await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                   f'{ctx.author.mention} title too long or too short.')
+        # Objective
+        objective = None
+        while objective is None:
+            waiting_objmsg = None
+            objective = "N/A"
+            try:
+                waiting_objmsg = await bot.wait_for('message', timeout=config.Bounty_Setting.obj_timeout, check=lambda msg: msg.author == ctx.author)
+            except asyncio.TimeoutError:
+                await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                               f'{ctx.author.mention} too long. We assumed you put **{objective}** as objective.'
+                               f'Next, please give a description of this bounty (min. {config.Bounty_Setting.desc_min}, '
+                               f'max. {config.Bounty_Setting.desc_max} chars, timeout {config.Bounty_Setting.desc_timeout}s):')
+                key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_obj"
+                redis_conn.set(key, objective)
+            if waiting_objmsg is None:
+                await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                               f'{ctx.author.mention} too long. We assumed you put **{objective}** as objective.'
+                               f'Next, please give a description of this bounty (min. {config.Bounty_Setting.desc_min}, '
+                               f'max. {config.Bounty_Setting.desc_max} chars):')
+                key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_obj"
+                redis_conn.set(key, objective)
+            else:
+                if config.Bounty_Setting.obj_min <= len(waiting_objmsg.content) <= config.Bounty_Setting.obj_max:
+                    objective = waiting_objmsg.content.strip()
+                    key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_obj"
+                    redis_conn.set(key, objective)
+                    msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                         f'Bounty objective set: **{objective}**\n'
+                                         f'Next, please give a description of this bounty (min. {config.Bounty_Setting.desc_min}, '
+                                         f'max. {config.Bounty_Setting.desc_max} chars):')
+                else:
+                    objective = None
+                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                    await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                   f'{ctx.author.mention} objective too long or too short.')
+        # DESC
+        desc = None
+        while desc is None:
+            waiting_descmsg = None
+            try:
+                waiting_descmsg = await bot.wait_for('message', timeout=config.Bounty_Setting.desc_timeout, check=lambda msg: msg.author == ctx.author)
+            except asyncio.TimeoutError:
+                # Delete redis and remove user from QUEUE
+                delete_queue_going(ctx.message.author.id)
+                await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                               f'{ctx.author.mention} too long. We assumed you are gave up during description input.')
+                return
+            if waiting_descmsg is None:
+                # Delete redis and remove user from QUEUE
+                delete_queue_going(ctx.message.author.id)
+                await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                               f'{ctx.author.mention} too long. We assumed you are gave up during description input.')
+                return
+            else:
+                if config.Bounty_Setting.desc_min <= len(waiting_descmsg.content) <= config.Bounty_Setting.desc_max:
+                    desc = waiting_descmsg.content.strip()
+                    key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_desc"
+                    redis_conn.set(key, desc)
+                    msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                         f'Bounty desc set: **{desc}**\n')
+                else:
+                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                    await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                   f'{ctx.author.mention} desc too long or too short.')
+        # Bounty Type
+        # TODO
+        msg = await ctx.send(f'{ctx.author.mention} Please select bounty type:\n'
+                             f'{EMOJI_RAISEHAND}: SINGLE, {EMOJI_HANDFINGERS}: MULTIPLE, {EMOJI_INFINITY}: UMLIMITED')
+        await msg.add_reaction(EMOJI_RAISEHAND)
+        await msg.add_reaction(EMOJI_HANDFINGERS)
+        await msg.add_reaction(EMOJI_INFINITY)
+        bounty_type = None
+        while bounty_type is None:
+            def check(reaction, user):
+                return user == ctx.message.author and reaction.message.id == msg.id  \
+                and str(reaction.emoji) in (EMOJI_RAISEHAND, EMOJI_HANDFINGERS, EMOJI_INFINITY)
+            try:
+                reaction, user = await bot.wait_for('reaction_add', timeout=60.0, check=check)
+            except asyncio.TimeoutError:
+                bounty_type = 'SINGLE'
+                await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                               f'Timeout. We use: **{bounty_type}**')
+            else:
+                if str(reaction.emoji) == EMOJI_INFINITY:
+                    bounty_type = 'UNLIMITED'
+                elif str(reaction.emoji) == EMOJI_HANDFINGERS:
+                    bounty_type = 'MULTIPLE'
+                elif str(reaction.emoji) == EMOJI_RAISEHAND:
+                    bounty_type = 'SINGLE'
+                key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_type"
+                redis_conn.set(key, bounty_type)
+                msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                     f'Bounty type: **{bounty_type}**\n')
+        try:
+            embed = discord.Embed(title="Bounty: {}".format(title), description="Here's your bountry before submit.", color=0x00ff00)
+            embed.add_field(name="Amount", value=f'{num_format_coin(real_amount, COIN_NAME)}{COIN_NAME}', inline=True)
+            embed.add_field(name="Creator", value=ctx.author.mention, inline=False)
+            embed.add_field(name="Objective", value=objective, inline=False)
+            embed.add_field(name="Description", value=desc, inline=False)
+            embed.add_field(name="Bounty Type", value=bounty_type, inline=False)
+            embed.add_field(name="Re-act", value=f'{EMOJI_THUMB_UP} to confirm, {EMOJI_THUMB_DOWN} to cancel', inline=False)
+            embed.set_thumbnail(url=ctx.message.author.avatar_url)
+            msg = await ctx.send(embed=embed)
+            await msg.add_reaction(EMOJI_THUMB_DOWN)
+            await msg.add_reaction(EMOJI_THUMB_UP)
+            def check(reaction, user):
+                return user == ctx.message.author and reaction.message.id == msg.id  \
+                and str(reaction.emoji) in (EMOJI_THUMB_DOWN, EMOJI_THUMB_UP)
+            reaction, user = await bot.wait_for('reaction_add', check=check)
+            if str(reaction.emoji) == EMOJI_THUMB_UP:
+                add = store.sql_bounty_add_data(COIN_NAME, random_string, real_amount, real_amount*(1 - config.Bounty_Fee_Margin), 
+                                                get_decimal(COIN_NAME), str(ctx.message.author.id), title, objective, 
+                                                desc, bounty_type, 'OPENED', 'DISCORD')
+                if add: 
+                    msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                         f'Status: **Submitted**')
+                    delete_queue_going(ctx.message.author.id)
+                    await msg.add_reaction(EMOJI_OK_BOX)
+                else:
+                    msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                         f'Status: **Not submitted** (Internal Error)')
+                    await msg.add_reaction(EMOJI_OK_BOX)
+            elif str(reaction.emoji) == EMOJI_THUMB_DOWN:
+                delete_queue_going(ctx.message.author.id)
+                msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                     f'Status: **Cancelled**')
+        except:
+            error = discord.Embed(title=":exclamation: Error", description=" :warning: Failed to display!", color=0xe51e1e)
+            await ctx.send(embed=error)
+    except (discord.Forbidden, discord.errors.Forbidden) as e:
+        # no permission to text or to re-act
+        await ctx.message.add_reaction(EMOJI_ERROR)
+    except Exception as e:
+        traceback.print_exc(file=sys.stdout)
+
+
+def delete_queue_going(userid: int):
+    global QUEUE_ADD_LIST, redis_pool, redis_conn
+    # Delete redis and remove user from QUEUE
+    if userid in QUEUE_ADD_LIST:
+        QUEUE_ADD_LIST.remove(userid)
+    keys = redis_conn.keys("CryptoBountyBot:BTYID_" + str(userid))
+    if len(keys) > 1:
+        for key in keys:
+            redis_conn.delete(key)
+
+
+@bounty.command(help=bot_help_bounty_edit)
+async def edit(ctx, ref: str = None):
+    # Remove if you are in any queue
+    if ctx.message.author.id in QUEUE_ADD_LIST:
+        delete_queue_going(ctx.message.author.id)
+    if ref is None:
+        list_bounty = store.sql_bounty_list_of_user(str(ctx.message.author.id), 'OPENED', 'DISCORD', 10)
+        if list_bounty and len(list_bounty) > 0:
+            # TODO: list ref number for user to select
+            lists = ", ".join([item['ref_id'] for item in list_bounty])
+            await ctx.send(f'{ctx.author.mention} Please use edit command with one of this ref: **{lists}**.')
+            return
+        else:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} you do not have any opened bounty to edit.')
+            return
+    else:
+        ref = ref.upper()
+        get_bounty_ref = store.sql_bounty_get_ref(ref, 'DISCORD')
+        if get_bounty_ref:
+            if get_bounty_ref['status'] != "OPENED":
+                await ctx.message.add_reaction(EMOJI_ERROR)
+                await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Bounty **{ref}** is not **OPENED** status.')
+                return
+            else:
+                if int(get_bounty_ref['userid_create']) != ctx.message.author.id:
+                    await ctx.message.add_reaction(EMOJI_ERROR)
+                    await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Bounty **{ref}** is not yours.')
+                    return
+                try:
+                    embed = discord.Embed(title="Bounty: {}".format(get_bounty_ref['bounty_title']), description="REF: {}".format(ref), color=0x00ff00)
+                    embed.add_field(name="Amount", value='{}{}'.format(num_format_coin(get_bounty_ref['bounty_amount'], get_bounty_ref['coin_name']), get_bounty_ref['coin_name']), inline=True)
+                    embed.add_field(name="Creator", value='<@{}> (id: {})'.format(get_bounty_ref['userid_create'], get_bounty_ref['userid_create']), inline=False)
+                    embed.add_field(name="Objective", value=get_bounty_ref['bounty_obj'], inline=False)
+                    embed.add_field(name="Description", value=get_bounty_ref['bounty_desc'], inline=False)
+                    embed.add_field(name="Bounty Type", value=get_bounty_ref['bounty_type'], inline=False)
+                    embed.add_field(name="Status", value=get_bounty_ref['status'], inline=False)
+                    embed.add_field(name="Re-act to edit", value=f'{EMOJI_GREENAPPLE}: Title, {EMOJI_TARGET}: Objective, '
+                                                                 f'{EMOJI_PINEAPPLE}: Description, \n{EMOJI_MONEYBAG}: Amount, '
+                                                                 f'{EMOJI_THUMB_DOWN}: to cancel', inline=True)
+                    embed.set_thumbnail(url=ctx.message.author.avatar_url)
+                    msg = await ctx.send(embed=embed)
+                    await msg.add_reaction(EMOJI_GREENAPPLE)
+                    await msg.add_reaction(EMOJI_TARGET)
+                    await msg.add_reaction(EMOJI_PINEAPPLE)
+                    await msg.add_reaction(EMOJI_MONEYBAG)
+                    await msg.add_reaction(EMOJI_THUMB_DOWN)
+                    def check(reaction, user):
+                        return user == ctx.message.author and reaction.message.id == msg.id  \
+                        and str(reaction.emoji) in (EMOJI_GREENAPPLE, EMOJI_TARGET, EMOJI_PINEAPPLE, EMOJI_MONEYBAG, EMOJI_THUMB_DOWN)
+                    reaction, user = await bot.wait_for('reaction_add', check=check)
+                    # Edit mode
+                    if str(reaction.emoji) == EMOJI_GREENAPPLE:
+                        # TITLE
+                        msg = await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                             f'Please give an update title of this bounty (min. {config.Bounty_Setting.title_min}, '
+                                             f'max. {config.Bounty_Setting.title_max} chars, timeout {config.Bounty_Setting.title_timeout}s):')
+                        title = None
+                        while title is None:
+                            waiting_titlemsg = None
+                            try:
+                                waiting_titlemsg = await bot.wait_for('message', timeout=config.Bounty_Setting.title_timeout, check=lambda msg: msg.author == ctx.author)
+                            except asyncio.TimeoutError:
+                                # Delete redis and remove user from QUEUE
+                                delete_queue_going(ctx.message.author.id)
+                                await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                               f'{ctx.author.mention} too long. We assumed you are gave up during title update.')
+                                return
+                            if waiting_titlemsg is None:
+                                # Delete redis and remove user from QUEUE
+                                delete_queue_going(ctx.message.author.id)
+                                await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                               f'{ctx.author.mention} too long. We assumed you are gave up during title update.')
+                                return
+                            else:
+                                if config.Bounty_Setting.title_min <= len(waiting_titlemsg.content) <= config.Bounty_Setting.title_max:
+                                    title = waiting_titlemsg.content.strip()
+                                    updated = store.sql_bounty_update_by_ref(ref, 'bounty_title', title, 'DISCORD')
+                                    msg = await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                         f'Bounty title updated to: **{title}**\n')
+                                    await msg.add_reaction(EMOJI_OK_BOX)
+                                    # Send updated one
+                                    try:
+                                        get_bounty_ref = store.sql_bounty_get_ref(ref, 'DISCORD')
+                                        embed = discord.Embed(title="Bounty: {}".format(get_bounty_ref['bounty_title']), description="REF: {}".format(ref), color=0x00ff00)
+                                        embed.add_field(name="Amount", value='{}{}'.format(num_format_coin(get_bounty_ref['bounty_amount'], get_bounty_ref['coin_name']), get_bounty_ref['coin_name']), inline=True)
+                                        embed.add_field(name="Creator", value='<@{}> (id: {})'.format(get_bounty_ref['userid_create'], get_bounty_ref['userid_create']), inline=False)
+                                        embed.add_field(name="Objective", value=get_bounty_ref['bounty_obj'], inline=False)
+                                        embed.add_field(name="Description", value=get_bounty_ref['bounty_desc'], inline=False)
+                                        embed.add_field(name="Bounty Type", value=get_bounty_ref['bounty_type'], inline=False)
+                                        embed.add_field(name="Status", value=get_bounty_ref['status'], inline=False)
+                                        embed.set_thumbnail(url=ctx.message.author.avatar_url)
+                                        msg = await ctx.send(embed=embed)
+                                        await msg.add_reaction(EMOJI_OK_BOX)
+                                    except Exception as e:
+                                        traceback.print_exc(file=sys.stdout)
+                                else:
+                                    title = None
+                                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                    await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                   f'{ctx.author.mention} title too long or too short.')
+                        return
+                    elif str(reaction.emoji) == EMOJI_TARGET:
+                        # Objective
+                        msg = await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                             f'Please give an update objective of this bounty (min. {config.Bounty_Setting.obj_min}, '
+                                             f'max. {config.Bounty_Setting.obj_max} chars, timeout {config.Bounty_Setting.obj_timeout}s):')
+                        objective = None
+                        while objective is None:
+                            waiting_objmsg = None
+                            try:
+                                waiting_objmsg = await bot.wait_for('message', timeout=config.Bounty_Setting.obj_timeout, check=lambda msg: msg.author == ctx.author)
+                            except asyncio.TimeoutError:
+                                await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                               f'{ctx.author.mention} too long. We assumed you are gave up during objective update.')
+                            if waiting_objmsg is None:
+                                await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                               f'{ctx.author.mention} too long. We assumed you are gave up during objective update.')
+                            else:
+                                if config.Bounty_Setting.obj_min <= len(waiting_objmsg.content) <= config.Bounty_Setting.obj_max:
+                                    objective = waiting_objmsg.content.strip()
+                                    updated = store.sql_bounty_update_by_ref(ref, 'bounty_obj', objective, 'DISCORD')
+                                    msg = await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                         f'Bounty objective updated to: **{objective}**\n')
+                                    await msg.add_reaction(EMOJI_OK_BOX)
+                                    # Send updated one
+                                    try:
+                                        get_bounty_ref = store.sql_bounty_get_ref(ref, 'DISCORD')
+                                        embed = discord.Embed(title="Bounty: {}".format(get_bounty_ref['bounty_title']), description="REF: {}".format(ref), color=0x00ff00)
+                                        embed.add_field(name="Amount", value='{}{}'.format(num_format_coin(get_bounty_ref['bounty_amount'], get_bounty_ref['coin_name']), get_bounty_ref['coin_name']), inline=True)
+                                        embed.add_field(name="Creator", value='<@{}> (id: {})'.format(get_bounty_ref['userid_create'], get_bounty_ref['userid_create']), inline=False)
+                                        embed.add_field(name="Objective", value=get_bounty_ref['bounty_obj'], inline=False)
+                                        embed.add_field(name="Description", value=get_bounty_ref['bounty_desc'], inline=False)
+                                        embed.add_field(name="Bounty Type", value=get_bounty_ref['bounty_type'], inline=False)
+                                        embed.add_field(name="Status", value=get_bounty_ref['status'], inline=False)
+                                        embed.set_thumbnail(url=ctx.message.author.avatar_url)
+                                        msg = await ctx.send(embed=embed)
+                                        await msg.add_reaction(EMOJI_OK_BOX)
+                                    except Exception as e:
+                                        traceback.print_exc(file=sys.stdout)
+                                else:
+                                    objective = None
+                                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                    await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                   f'{ctx.author.mention} objective too long or too short.')
+                        return
+                    elif str(reaction.emoji) == EMOJI_PINEAPPLE:
+                        # Description
+                        msg = await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                             f'Please give an update description of this bounty (min. {config.Bounty_Setting.desc_min}, '
+                                             f'max. {config.Bounty_Setting.desc_max} chars, timeout {config.Bounty_Setting.desc_timeout}s):')
+                        desc = None
+                        while desc is None:
+                            waiting_descmsg = None
+                            try:
+                                waiting_descmsg = await bot.wait_for('message', timeout=config.Bounty_Setting.desc_timeout, check=lambda msg: msg.author == ctx.author)
+                            except asyncio.TimeoutError:
+                                await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                               f'{ctx.author.mention} too long. We assumed you are gave up during description update.')
+                            if waiting_descmsg is None:
+                                await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                               f'{ctx.author.mention} too long. We assumed you are gave up during description update.')
+                            else:
+                                if config.Bounty_Setting.desc_min <= len(waiting_descmsg.content) <= config.Bounty_Setting.desc_max:
+                                    desc = waiting_descmsg.content.strip()
+                                    updated = store.sql_bounty_update_by_ref(ref, 'bounty_desc', desc, 'DISCORD')
+                                    msg = await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                         f'Bounty description updated to: **{desc}**\n')
+                                    await msg.add_reaction(EMOJI_OK_BOX)
+                                    # Send updated one
+                                    try:
+                                        get_bounty_ref = store.sql_bounty_get_ref(ref, 'DISCORD')
+                                        embed = discord.Embed(title="Bounty: {}".format(get_bounty_ref['bounty_title']), description="REF: {}".format(ref), color=0x00ff00)
+                                        embed.add_field(name="Amount", value='{}{}'.format(num_format_coin(get_bounty_ref['bounty_amount'], get_bounty_ref['coin_name']), get_bounty_ref['coin_name']), inline=True)
+                                        embed.add_field(name="Creator", value='<@{}> (id: {})'.format(get_bounty_ref['userid_create'], get_bounty_ref['userid_create']), inline=False)
+                                        embed.add_field(name="Objective", value=get_bounty_ref['bounty_obj'], inline=False)
+                                        embed.add_field(name="Description", value=get_bounty_ref['bounty_desc'], inline=False)
+                                        embed.add_field(name="Bounty Type", value=get_bounty_ref['bounty_type'], inline=False)
+                                        embed.add_field(name="Status", value=get_bounty_ref['status'], inline=False)
+                                        embed.set_thumbnail(url=ctx.message.author.avatar_url)
+                                        msg = await ctx.send(embed=embed)
+                                        await msg.add_reaction(EMOJI_OK_BOX)
+                                    except Exception as e:
+                                        traceback.print_exc(file=sys.stdout)
+                                else:
+                                    desc = None
+                                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                    await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                   f'{ctx.author.mention} description too long or too short.')
+                        return
+                    elif str(reaction.emoji) == EMOJI_MONEYBAG:
+                        # Amount
+                        msg = await ctx.send('BOUNTY ID: **{}**\n'
+                                             'Please type in **amount coin_name** to update this bounty price (timeout {}s):\n'
+                                             'Supported coin: {}'.format(ref, config.Bounty_Setting.price_timeout, ", ".join(ENABLE_COIN)))
+                        amount = None
+                        COIN_NAME = None
+                        while (amount is None) or (COIN_NAME not in ENABLE_COIN):
+                            waiting_pricemsg = None
+                            try:
+                                waiting_pricemsg = await bot.wait_for('message', timeout=config.Bounty_Setting.price_timeout, check=lambda msg: msg.author == ctx.author)
+                            except asyncio.TimeoutError:
+                                # Delete redis and remove user from QUEUE
+                                delete_queue_going(ctx.message.author.id)
+                                await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                               f'{ctx.author.mention} too long. We assumed you are gave up during bounty price update.')
+                                return
+                            if waiting_pricemsg is None:
+                                # Delete redis and remove user from QUEUE
+                                delete_queue_going(ctx.message.author.id)
+                                await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                               f'{ctx.author.mention} too long. We assumed you are gave up during bounty price update.')
+                                return
+                            else:
+                                msg_content = waiting_pricemsg.content.split(" ")
+                                if len(msg_content) != 2:
+                                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                    await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                   f'{ctx.author.mention} Please use **amount coin_name**. Example `1,000,000 WRKZ`')
+                                else:
+                                    amount = msg_content[0]
+                                    COIN_NAME = msg_content[1].upper()
+                                    if COIN_NAME not in ENABLE_COIN:
+                                        accepted_coin = ", ".join(ENABLE_COIN)
+                                        await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                        await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                       f'{ctx.author.mention} Please use accepted coin: **{accepted_coin}**.')
+                                    else:
+                                        amount = amount.replace(",", "")
+                                        try:
+                                            amount = float(amount)
+                                            MinTx = get_min_bounty(COIN_NAME)
+                                            MaxTX = get_max_bounty(COIN_NAME)
+                                            real_amount = amount*get_decimal(COIN_NAME)
+                                            if MinTx <= real_amount <= MaxTX:
+                                                # check user balance
+                                                user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+                                                if user_from is None:
+                                                    user_from = await store.sql_register_user(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+                                                    user_from = await store.sql_get_userwallet(str(ctx.message.author.id), COIN_NAME)
+                                                userdata_balance = store.sql_user_balance(str(ctx.message.author.id), COIN_NAME, 'DISCORD')
+                                                user_from['actual_balance'] = user_from['actual_balance'] + float(userdata_balance['Adjust'])
+                                                if user_from['actual_balance'] < real_amount:
+                                                    await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                                    await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                                   f'{ctx.author.mention} Insufficient balance to update a bounty to '
+                                                                   f'**{num_format_coin(real_amount, COIN_NAME)}{COIN_NAME}**\n'
+                                                                   'Try to lower the bounty amount again.')
+                                                    amount = None
+                                                else:
+                                                    update = store.sql_bounty_update_by_ref(ref, 'amount', 
+                                                                                        json.dumps({'coin_name': COIN_NAME, 'bounty_amount': real_amount, 'bounty_amount_after_fee': real_amount,
+                                                                                        'bounty_coin_decimal': get_decimal(COIN_NAME)}), 'DISCORD')
+                                                    msg = await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                                         f'Bounty amount updated to: **{num_format_coin(real_amount, COIN_NAME)}{COIN_NAME}**\n')
+                                                    await msg.add_reaction(EMOJI_OK_BOX)
+                                                    # Send updated one
+                                                    try:
+                                                        get_bounty_ref = store.sql_bounty_get_ref(ref, 'DISCORD')
+                                                        embed = discord.Embed(title="Bounty: {}".format(get_bounty_ref['bounty_title']), description="REF: {}".format(ref), color=0x00ff00)
+                                                        embed.add_field(name="Amount", value='{}{}'.format(num_format_coin(get_bounty_ref['bounty_amount'], get_bounty_ref['coin_name']), get_bounty_ref['coin_name']), inline=True)
+                                                        embed.add_field(name="Creator", value='<@{}> (id: {})'.format(get_bounty_ref['userid_create'], get_bounty_ref['userid_create']), inline=False)
+                                                        embed.add_field(name="Objective", value=get_bounty_ref['bounty_obj'], inline=False)
+                                                        embed.add_field(name="Description", value=get_bounty_ref['bounty_desc'], inline=False)
+                                                        embed.add_field(name="Bounty Type", value=get_bounty_ref['bounty_type'], inline=False)
+                                                        embed.add_field(name="Status", value=get_bounty_ref['status'], inline=False)
+                                                        embed.set_thumbnail(url=ctx.message.author.avatar_url)
+                                                        msg = await ctx.send(embed=embed)
+                                                        await msg.add_reaction(EMOJI_OK_BOX)
+                                                    except Exception as e:
+                                                        traceback.print_exc(file=sys.stdout)
+                                            else:
+                                                await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                                await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                               f'{ctx.author.mention} Amount input is not between '
+                                                               f'{num_format_coin(MinTx, COIN_NAME)}{COIN_NAME}, {num_format_coin(MaxTX, COIN_NAME)}{COIN_NAME}.')
+                                                amount = None
+                                        except ValueError:
+                                            amount = None
+                                            await waiting_pricemsg.add_reaction(EMOJI_ERROR)
+                                            await ctx.send(f'BOUNTY ID: **{ref}**\n'
+                                                           f'{EMOJI_RED_NO} {ctx.author.mention} Invalid amount.')
+                        return
+                    elif str(reaction.emoji) == EMOJI_THUMB_DOWN:
+                        delete_queue_going(ctx.message.author.id)
+                        msg = await ctx.send('BOUNTY ID: **{}**\n'
+                                             'Editing: **Cancelled**'.format(ref))
+                        return
+                except:
+                    error = discord.Embed(title=":exclamation: Error", description=" :warning: Failed to display!", color=0xe51e1e)
+                    await ctx.send(embed=error)
+                    return
+        else:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Can not find **{ref}** in active bounty.')
+            return
+
+
+@bounty.command(help=bot_help_bounty_cancel)
+async def cancel(ctx, ref: str = None):
+    global QUEUE_ADD_LIST
+    if ref is None:
+        delete_queue_going(ctx.message.author.id)
+        if ctx.message.author.id not in QUEUE_ADD_LIST:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} you are not in any progress of adding bounty.')
+            return
+        else:
+            QUEUE_ADD_LIST.remove(ctx.message.author.id)
+            await ctx.send(f'{ctx.author.mention} Successfully cancelled progressing bounty entry.')
+            return
+    else:
+        # find ref
+        return
+
+
+@bounty.command(help=bot_help_bounty_end)
+async def end(ctx, ref: str):
+    global QUEUE_ADD_LIST, redis_pool, redis_conn
+    ref = ref.upper()
+    get_bounty_ref = store.sql_bounty_get_ref(ref, 'DISCORD')
+    if get_bounty_ref:
+        if int(get_bounty_ref['userid_create']) != ctx.message.author.id:
+            # Not his
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Bounty **{ref}** is not yours.')
+            return
+        else:
+            # OK his bounty
+            if get_bounty_ref['status'] != 'OPENED':
+                await ctx.message.add_reaction(EMOJI_ERROR)
+                await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Bounty **{ref}** is not **OPENED**.')
+                return
+            else:
+                new_status = 'CANCELLED'
+                update = store.sql_bounty_update_by_ref(ref, 'status', new_status, 'DISCORD')
+                if update:
+                    await ctx.message.add_reaction(EMOJI_OK_HAND)
+                    msg = await ctx.send(f'{ctx.author.mention} Bounty **{ref}** status changed from **OPENED** to **{new_status}**.')
+                    await msg.add_reaction(EMOJI_OK_BOX)
+                    return
+                else:
+                    await ctx.message.add_reaction(EMOJI_ERROR)
+                    return
+    else:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Can not find **{ref}** bounty.')
+        return
+    return
+
+
+@bounty.command(help=bot_help_bounty_complete)
+async def complete(ctx, ref: str):
+    return
+
+
+@bounty.command(help=bot_help_bounty_confirm_app)
+async def confirm_app(ctx, app_ref: str):
+    return
+
+
+@bounty.command(help=bot_help_bounty_search)
+async def search(ctx, *, message):
+    return
+
+@bounty.command(help=bot_help_bounty_mylist)
+async def mylist(ctx, status: str='ALL'):
+    list_bounty = None
+    status = status.upper()
+    if status.upper() not in ['COMPLETED','OPENED','ONGOING','CANCELLED', 'ALL']:
+        status_list = ", ".join(['COMPLETED','OPENED','ONGOING','CANCELLED'])
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Please give filter of correct status ({status_list}).')
+        return
+    else:
+        list_bounty = store.sql_bounty_list_of_user(str(ctx.message.author.id), status, 'DISCORD', 20)
+    if list_bounty and len(list_bounty) > 0:
+        table_data = [
+            ['REF', 'Amount', 'Status', 'Title']
+        ]
+        for each in list_bounty:
+            table_data.append([each['ref_id'], num_format_coin(each['bounty_amount'], each['coin_name'])+each['coin_name'], 
+                               each['status'], each['bounty_title'][:32]])
+        table = AsciiTable(table_data)
+        # table.inner_column_border = False
+        # table.outer_border = False
+        table.padding_left = 1
+        table.padding_right = 1
+        msg = await ctx.send('**[ YOUR BOUNTY LIST ]**\n'
+                             f'```{table.table}```')
+        return
+    else:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} you do not have any bounty.')
+        return
+
+
+@bounty.command(help=bot_help_bounty_mylist_app)
+async def mylist_apply(ctx, status: str='ALL'):
+    list_applied_bounty = None
+    status = status.upper()
+    if status.upper() not in ['ACCEPTED','REJECTED','APPLIED','COMPLETED','CANCELLED', 'ALL']:
+        status_list = ", ".join(['ACCEPTED','REJECTED','APPLIED','COMPLETED','CANCELLED'])
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Please give filter of correct status ({status_list}).')
+        return
+    else:
+        list_applied_bounty = store.sql_bounty_list_of_apply(str(ctx.message.author.id), status, 'DISCORD', 20)
+    if list_applied_bounty and len(list_applied_bounty) > 0:
+        table_data = [
+            ['REF', 'Applied ID', 'Status', 'Amount']
+        ]
+        for each in list_applied_bounty:
+            table_data.append([each['bounty_ref_id'], each['applied_id'], each['status'], 
+                               num_format_coin(each['bounty_amount'], each['coin_name'])+each['coin_name']])
+        table = AsciiTable(table_data)
+        # table.inner_column_border = False
+        # table.outer_border = False
+        table.padding_left = 1
+        table.padding_right = 1
+        msg = await ctx.send('**[ YOUR APPLIED LIST ]**\n'
+                             f'```{table.table}```')
+        return
+    else:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} you do not have any application for a bounty.')
+        return
+
+
+@bounty.command(help=bot_help_bounty_detail)
+async def detail(ctx, ref: str):
+    global QUEUE_ADD_LIST, redis_pool, redis_conn
+    ref = ref.upper()
+    get_bounty_ref = store.sql_bounty_get_ref(ref, 'DISCORD')
+    if get_bounty_ref:
+        try:
+            embed = discord.Embed(title="Bounty: {}".format(get_bounty_ref['bounty_title']), description="REF: {}".format(ref), color=0x00ff00)
+            embed.add_field(name="Amount", value='{}{}'.format(num_format_coin(get_bounty_ref['bounty_amount'], get_bounty_ref['coin_name']), get_bounty_ref['coin_name']), inline=True)
+            embed.add_field(name="Creator", value='<@{}> (id: {})'.format(get_bounty_ref['userid_create'], get_bounty_ref['userid_create']), inline=False)
+            embed.add_field(name="Objective", value=get_bounty_ref['bounty_obj'], inline=False)
+            embed.add_field(name="Description", value=get_bounty_ref['bounty_desc'], inline=False)
+            embed.add_field(name="Bounty Type", value=get_bounty_ref['bounty_type'], inline=False)
+            try:
+                get_applicants = store.sql_bounty_get_apply_by_ref('ALL', ref, 'DISCORD')
+                if get_applicants and len(get_applicants) > 0:
+                    embed.add_field(name="Total applied", value=len(get_applicants), inline=False)
+                    list_applied = [item['applied_id'] for item in get_applicants if item['status'] == 'APPLIED']
+                    embed.add_field(name="Applied Ref", value='{}'.format(", ".join(list_applied) if len(list_applied) > 0 else 'N/A'), inline=False)
+            except Exception as e:
+                traceback.print_exc(file=sys.stdout)
+            embed.add_field(name="Status", value=get_bounty_ref['status'], inline=False)
+            embed.set_thumbnail(url=bot.user.avatar_url)
+            msg = await ctx.send(embed=embed)
+            await msg.add_reaction(EMOJI_OK_BOX)
+        except:
+            error = discord.Embed(title=":exclamation: Error", description=" :warning: Failed to display!", color=0xe51e1e)
+            await ctx.send(embed=error)
+            return
+    else:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Can not find **{ref}** bounty.')
+        return
+    return
+
+
+@bounty.command(help=bot_help_bounty_apply)
+async def apply(ctx, ref: str):
+    global QUEUE_ADD_LIST, redis_pool, redis_conn
+    ref = ref.upper()
+    get_bounty_ref = store.sql_bounty_get_ref(ref, 'DISCORD')
+    if get_bounty_ref:
+        if int(get_bounty_ref['userid_create']) == ctx.message.author.id:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You can not apply for your own bounty **{ref}**.')
+            return
+        if get_bounty_ref['status'] != 'OPENED':
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Bounty **{ref}** is not **OPENED**.')
+            return
+        # Check if he already applied:
+        check_apply = store.sql_bounty_get_apply_by_ref(str(ctx.message.author.id), ref, 'DISCORD')
+        if check_apply:
+            # Tell him he already applied and status
+            status_apply = check_apply['status']
+            if status_apply == 'CANCELLED':
+                await ctx.message.add_reaction(EMOJI_ERROR)
+                await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You already cancelled for bounty **{ref}** and status is **{status_apply}**.')
+                return
+            else:
+                await ctx.message.add_reaction(EMOJI_ERROR)
+                await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You already applied for bounty **{ref}** and status is **{status_apply}**.')
+                return
+        # Check if too many people apply already
+        check_apply = store.sql_bounty_get_apply_by_ref('ALL', ref, 'DISCORD')
+        if check_apply and len(check_apply) > config.Max_Apply_Per_One_Bounty:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} There are many people applied for **{ref}**. Application rejected.')
+            return
+        try:
+            embed = discord.Embed(title="Bounty: {}".format(get_bounty_ref['bounty_title']), description="REF: {}".format(ref), color=0x00ff00)
+            embed.add_field(name="Amount", value='{}{}'.format(num_format_coin(get_bounty_ref['bounty_amount'], get_bounty_ref['coin_name']), get_bounty_ref['coin_name']), inline=True)
+            embed.add_field(name="Creator", value='<@{}> (id: {})'.format(get_bounty_ref['userid_create'], get_bounty_ref['userid_create']), inline=False)
+            embed.add_field(name="Objective", value=get_bounty_ref['bounty_obj'], inline=False)
+            embed.add_field(name="Description", value=get_bounty_ref['bounty_desc'], inline=False)
+            embed.add_field(name="Bounty Type", value=get_bounty_ref['bounty_type'], inline=False)
+            embed.add_field(name="Status", value=get_bounty_ref['status'], inline=False)
+            embed.add_field(name="Re-act", value=f'{EMOJI_THUMB_UP} to apply, {EMOJI_THUMB_DOWN} to cancel', inline=False)
+            embed.set_thumbnail(url=bot.user.avatar_url)
+            msg = await ctx.send(embed=embed)
+            await msg.add_reaction(EMOJI_THUMB_DOWN)
+            await msg.add_reaction(EMOJI_THUMB_UP)
+            def check(reaction, user):
+                return user == ctx.message.author and reaction.message.author == bot.user and reaction.message.id == msg.id \
+                and str(reaction.emoji) in (EMOJI_THUMB_UP, EMOJI_THUMB_DOWN)
+            try:
+                reaction, user = await bot.wait_for('reaction_add', timeout=config.Bounty_Setting.default_timeout, check=check)
+                if str(reaction.emoji) == EMOJI_THUMB_UP:
+                    # he want to apply
+                    user_numb_bounty = store.sql_bounty_list_of_user_apply(str(ctx.message.author.id), 'ALL', 'DISCORD', 'APPLIED')
+                    if user_numb_bounty and len(user_numb_bounty) > config.Max_Apply_Bounty:
+                        await ctx.send(f'{ctx.author.mention} You had applied already {len(user_numb_bounty)}. Cancel some if you want to apply this **{ref}**.')
+                        return
+                    else:
+                        # OK, let him apply
+                        random_string = randomString(16).upper() 
+                        add = store.sql_bounty_add_apply(get_bounty_ref['coin_name'], random_string, str(ctx.message.author.id), ref, get_bounty_ref['userid_create'], 
+                                                        get_bounty_ref['bounty_amount'], get_bounty_ref['bounty_amount_after_fee'], 
+                                                        get_bounty_ref['bounty_coin_decimal'], 'APPLIED', 'DISCORD')
+                        if add: 
+                            msg = await ctx.send(f'You applied for BOUNTY ID: **{ref}**\n'
+                                                 f'Applied ID: **{random_string}**\n'
+                                                 f'Status: **Applied**')
+                            await msg.add_reaction(EMOJI_OK_BOX)
+                        else:
+                            msg = await ctx.send(f'You applied for BOUNTY ID: **{ref}**\n'
+                                                 f'Status: **Not submitted** (Internal Error)')
+                            await msg.add_reaction(EMOJI_OK_BOX)
+                else:
+                    await ctx.send(f'{ctx.author.mention} You cancelled to apply bounty: **{ref}**')
+                    return
+            except asyncio.TimeoutError:
+                await ctx.send(f'{ctx.author.mention} too long. We assumed you are {EMOJI_THUMB_DOWN} and cancelled bounty application for **{ref}**')
+                return
+        except:
+            error = discord.Embed(title=":exclamation: Error", description=" :warning: Failed to display!", color=0xe51e1e)
+            await ctx.send(embed=error)
+            return
+    else:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Can not find **{ref}** bounty.')
+        return
+    return
+
+
+@bounty.command(help=bot_help_bounty_cancelapply)
+async def cancel_apply(ctx, ref: str):
+    global QUEUE_ADD_LIST, redis_pool, redis_conn
+    ref = ref.upper()
+    get_bounty_app_ref = store.sql_bounty_get_apply_by_ref(str(ctx.message.author.id), ref, 'DISCORD')
+    if get_bounty_app_ref is None:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You haven\'t applied for **{ref}**.')
+        return
+    else:
+        status_app = get_bounty_app_ref['status']
+        if get_bounty_app_ref['status'] != 'APPLIED':
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} can not cancelled **{ref}** which is currently **{status_app}**.')
+            return
+        else:
+            # OK update status to cancelled
+            update = store.sql_bounty_update_apply_by_ref(ref, str(ctx.message.author.id), 'status', 'CANCELLED', 'DISCORD')
+            if update:
+                await ctx.message.add_reaction(EMOJI_OK_HAND)
+                msg = await ctx.send(f'{ctx.author.mention} You cancelled a bounty **{ref}** status changed from **{status_app}** to **CANCELLED**.')
+                await msg.add_reaction(EMOJI_OK_BOX)
+                return
+            else:
+                await ctx.message.add_reaction(EMOJI_ERROR)
+                return
+    return
+
+
+@bounty.command(help=bot_help_bounty_submit)
+async def submit(ctx, ref: str):
+    return
 
 @bot.command(pass_context=True, name='bountybot', help=bot_help_usage)
 async def bountybot(ctx):
@@ -1309,6 +2265,76 @@ async def withdraw_error(ctx, error):
         await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing amount and/or ticker. '
                        f'You need to tell me **AMOUNT** and/or **TICKER**.\nExample: {prefix}withdraw **1,000 coin_name**')
     return
+
+
+@bounty.error
+async def bounty_error(ctx, error):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing argument. '
+                       f'Please use help of each subcommand. Example: {prefix}help bounty OR {prefix}help bounty subcommand')
+    return
+
+
+@bounty.error
+@detail.error
+async def bounty_detail_error(ctx, error):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing argument. '
+                       f'Please use help of each subcommand. Example: {prefix}help bounty OR {prefix}help bounty detail')
+    return
+
+
+@bounty.error
+@mylist.error
+async def bounty_mylist_error(ctx, error):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing argument. '
+                       f'Please use help of each subcommand. Example: {prefix}help bounty OR {prefix}help bounty mylist')
+    return
+
+
+@bounty.error
+@end.error
+async def bounty_detail_error(ctx, error):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing argument. '
+                       f'Please use help of each subcommand. Example: {prefix}help bounty OR {prefix}help bounty end')
+    return
+
+
+@bounty.error
+@apply.error
+async def bounty_detail_error(ctx, error):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing argument. '
+                       f'Please use help of each subcommand. Example: {prefix}help bounty OR {prefix}help bounty apply')
+    return
+
+
+@bounty.error
+@cancel_apply.error
+async def bounty_cancel_apply_error(ctx, error):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing argument. '
+                       f'Please use help of each subcommand. Example: {prefix}help bounty OR {prefix}help bounty cancel_apply')
+    return
+
+
+def randomString(stringLength=8):
+    letters = string.ascii_lowercase
+    return ''.join(random.choice(letters) for i in range(stringLength))
 
 
 @click.command()
