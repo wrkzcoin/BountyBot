@@ -756,6 +756,50 @@ async def add(ctx):
                     bounty_type = 'MULTIPLE'
                 elif str(reaction.emoji) == EMOJI_RAISEHAND:
                     bounty_type = 'SINGLE'
+                if str(reaction.emoji) == EMOJI_INFINITY or str(reaction.emoji) == EMOJI_HANDFINGERS:
+                    # Need to cap max.
+                    msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                     'You are not selecting **SINGLE** type. '
+                                     'Please let us know what is the maximum number of application you can accept. '
+                                     f'Give integer value only (timeout: {config.Bounty_Setting.default_timeout}s): ')
+                    bounty_number = None
+                    while bounty_number is None:
+                        waiting_numbermsg = None
+                        try:
+                            waiting_numbermsg = await bot.wait_for('message', timeout=config.Bounty_Setting.default_timeout, check=lambda msg: msg.author == ctx.author)
+                        except asyncio.TimeoutError:
+                            # Delete redis and remove user from QUEUE
+                            delete_queue_going(ctx.message.author.id)
+                            await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                           f'{ctx.author.mention} too long. We assumed you are using **SINGLE** bounty type instead.')
+                            bounty_type = 'SINGLE'
+                            bounty_number = 1
+                        if waiting_numbermsg is None:
+                            # Delete redis and remove user from QUEUE
+                            delete_queue_going(ctx.message.author.id)
+                            await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                           f'{ctx.author.mention} too long. We assumed you are using **SINGLE** bounty type instead.')
+                            bounty_type = 'SINGLE'
+                            bounty_number = 1
+                        else:
+                            bounty_number = waiting_numbermsg.content.strip()
+                            bounty_number = bounty_number.replace(",", "")
+                            try:
+                                bounty_number = int(bounty_number)
+                                # check user balance
+                                if user_from['actual_balance'] < real_amount*bounty_number:
+                                    await waiting_numbermsg.add_reaction(EMOJI_ERROR)
+                                    await ctx.send(f'{ctx.author.mention} Insufficient balance to make a {bounty_number} bounties of '
+                                                   f'**{num_format_coin(real_amount, COIN_NAME)}{COIN_NAME}**\n'
+                                                   'Try to lower the number again.')
+                                    bounty_number = None
+                                else:
+                                    await ctx.send(f'BOUNTY ID: **{random_string}**\n'
+                                                   f'{ctx.author.mention} Bounty is now available for: {bounty_number} applications.')
+                            except ValueError:
+                                bounty_number = None
+                                await waiting_numbermsg.add_reaction(EMOJI_ERROR)
+                                await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Invalid bounty number.')
                 key = "CryptoBountyBot:BTYID_" + str(ctx.message.author.id) + ":bounty_type"
                 redis_conn.set(key, bounty_type)
                 msg = await ctx.send(f'BOUNTY ID: **{random_string}**\n'
@@ -767,6 +811,8 @@ async def add(ctx):
             embed.add_field(name="Objective", value=objective, inline=False)
             embed.add_field(name="Description", value=desc, inline=False)
             embed.add_field(name="Bounty Type", value=bounty_type, inline=False)
+            if bounty_number and bounty_type != 'SINGLE':
+                embed.add_field(name="Max. Application", value=bounty_number, inline=False)
             embed.add_field(name="Re-act", value=f'{EMOJI_THUMB_UP} to confirm, {EMOJI_THUMB_DOWN} to cancel', inline=False)
             embed.set_thumbnail(url=ctx.message.author.avatar_url)
             msg = await ctx.send(embed=embed)
@@ -777,7 +823,7 @@ async def add(ctx):
                 and str(reaction.emoji) in (EMOJI_THUMB_DOWN, EMOJI_THUMB_UP)
             reaction, user = await bot.wait_for('reaction_add', check=check)
             if str(reaction.emoji) == EMOJI_THUMB_UP:
-                add = store.sql_bounty_add_data(COIN_NAME, random_string, real_amount, real_amount*(1 - config.Bounty_Fee_Margin), 
+                add = store.sql_bounty_add_data(bounty_number, COIN_NAME, random_string, real_amount, real_amount*(1 - config.Bounty_Fee_Margin), 
                                                 get_decimal(COIN_NAME), str(ctx.message.author.id), title, objective, 
                                                 desc, bounty_type, 'OPENED', 'DISCORD')
                 if add: 
@@ -1172,6 +1218,76 @@ async def complete(ctx, ref: str):
 
 @bounty.command(help=bot_help_bounty_confirm_app)
 async def confirm_app(ctx, app_ref: str):
+    global QUEUE_ADD_LIST, redis_pool, redis_conn
+    app_ref = app_ref.upper()
+    get_bounty_app_ref = store.sql_bounty_get_apply_by_app_ref('*', app_ref, 'DISCORD')
+    if get_bounty_app_ref:
+        ref = get_bounty_app_ref['bounty_ref_id']
+        if int(get_bounty_app_ref['userid_create']) != ctx.message.author.id:
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} **{ref}** is not belong to you.')
+            return
+        if get_bounty_app_ref['status'] in ['ACCEPTED','REJECTED','COMPLETED','CANCELLED']:
+            status = get_bounty_app_ref['status']
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} **{app_ref}** was already **{status}**. Nothing to do.')
+            return
+        elif get_bounty_app_ref['status'] == 'APPLIED':
+            get_bounty_ref = store.sql_bounty_get_ref(ref, 'DISCORD')
+            get_bounty_app_ref_all = store.sql_bounty_get_apply_by_app_ref(ref, 'ALL', 'DISCORD')
+            if get_bounty_ref and get_bounty_ref['status'] != "OPENED":
+                await ctx.message.add_reaction(EMOJI_ERROR)
+                await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Bounty **{ref}** is not **OPENED** status.')
+                return
+            elif get_bounty_ref and get_bounty_ref['status'] == "OPENED":
+                # TODO: check how many applied and how many ACCEPTED
+                # TODO: If single, turn status to ONGOING
+                accepting_list = []
+                if get_bounty_app_ref_all and len(get_bounty_app_ref_all) > 0:
+                    for item in get_bounty_app_ref_all:
+                        if item['status'] == 'ACCEPTED': accepting_list.append(item['applied_id'])
+                if get_bounty_ref['bounty_type'] == 'SINGLE':
+                    # We accept only one
+                    if len(accepting_list) > 0:
+                        await ctx.message.add_reaction(EMOJI_ERROR)
+                        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You had accepted one or more application for **{ref}** already.')
+                    else:
+                        # Turn status to 'ACCEPTED' for app_ref
+                        update = store.sql_bounty_update_apply_by_ref(ref, get_bounty_app_ref['applied_userid'], 'status', 'ACCEPTED', 'DISCORD')
+                        if update:
+                            msg = await ctx.send(f'{ctx.author.mention} You are accepting application ref: **{app_ref}** for bounty **{ref}**')
+                            await msg.add_reaction(EMOJI_OK_BOX)
+                        else:
+                            await ctx.message.add_reaction(EMOJI_ERROR)
+                    return
+                elif get_bounty_ref['bounty_type'] == 'MULTIPLE' or get_bounty_ref['bounty_type'] == 'UNLIMITED':
+                    # We can accept more than one
+                    if 'bounty_number' in get_bounty_ref and isinstance(get_bounty_ref['bounty_number'], int) and len(accepting_list) >= get_bounty_ref['bounty_number']:
+                        max_accepted = get_bounty_ref['bounty_number']
+                        await ctx.message.add_reaction(EMOJI_ERROR)
+                        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You had accepted {max_accepted} applications for **{ref}** already.')
+                        return
+                    elif len(accepting_list) >= 2:
+                        max_accepted = 2
+                        await ctx.message.add_reaction(EMOJI_ERROR)
+                        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You had accepted {max_accepted} applications for **{ref}** already.')
+                        return
+                    elif len(accepting_list) < 2:
+                        # Turn status to 'ACCEPTED' for app_ref
+                        update = store.sql_bounty_update_apply_by_ref(ref, get_bounty_app_ref['applied_userid'], 'status', 'ACCEPTED', 'DISCORD')
+                        if update:
+                            msg = await ctx.send(f'{ctx.author.mention} You are accepting application ref: **{app_ref}** for bounty **{ref}**')
+                            await msg.add_reaction(EMOJI_OK_BOX)
+                        else:
+                            await ctx.message.add_reaction(EMOJI_ERROR)
+            else:
+                await ctx.message.add_reaction(EMOJI_ERROR)
+                await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Can not find **{ref}** bounty.')
+                return
+    else:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Can not find application ID **{app_ref}** in any bounty.')
+        return
     return
 
 
@@ -1255,7 +1371,10 @@ async def detail(ctx, ref: str):
             embed.add_field(name="Creator", value='<@{}> (id: {})'.format(get_bounty_ref['userid_create'], get_bounty_ref['userid_create']), inline=False)
             embed.add_field(name="Objective", value=get_bounty_ref['bounty_obj'], inline=False)
             embed.add_field(name="Description", value=get_bounty_ref['bounty_desc'], inline=False)
-            embed.add_field(name="Bounty Type", value=get_bounty_ref['bounty_type'], inline=False)
+            if 'bounty_number' in get_bounty_ref and isinstance(get_bounty_ref['bounty_number'], int):
+                embed.add_field(name="Bounty Type", value='{} (Max. Application: {})'.format(get_bounty_ref['bounty_type'], get_bounty_ref['bounty_number']), inline=False)
+            else:
+                embed.add_field(name="Bounty Type", value=get_bounty_ref['bounty_type'], inline=False)
             try:
                 get_applicants = store.sql_bounty_get_apply_by_ref('ALL', ref, 'DISCORD')
                 if get_applicants and len(get_applicants) > 0:
@@ -1399,7 +1518,34 @@ async def cancel_apply(ctx, ref: str):
 
 @bounty.command(help=bot_help_bounty_submit)
 async def submit(ctx, ref: str):
-    return
+    global QUEUE_ADD_LIST, redis_pool, redis_conn
+    ref = ref.upper()
+    get_bounty_app_ref = store.sql_bounty_get_apply_by_ref(str(ctx.message.author.id), ref, 'DISCORD')
+    if get_bounty_app_ref is None:
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} You haven\'t applied for **{ref}**.')
+        return
+    else:
+        if get_bounty_app_ref['status'] == 'ACCEPTED':
+            # Yes status accepted so he can submit
+            return
+        elif get_bounty_app_ref['status'] == 'REJECTED':
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Your application **{ref}** was **REJECTED**. You can not submit anything.')
+            return
+        elif get_bounty_app_ref['status'] == 'APPLIED':
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Your application **{ref}** is stilled **APPLIED**. Wait until it is **ACCEPTED**')
+            return
+        elif get_bounty_app_ref['status'] == 'COMPLETED':
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Your application **{ref}** is already **COMPLETED**.')
+            return
+        elif get_bounty_app_ref['status'] == 'CANCELLED':
+            await ctx.message.add_reaction(EMOJI_ERROR)
+            await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Your can not submit **{ref}** which was already **CANCELLED**.')
+            return
+
 
 @bot.command(pass_context=True, name='bountybot', help=bot_help_usage)
 async def bountybot(ctx):
@@ -2331,6 +2477,16 @@ async def bounty_cancel_apply_error(ctx, error):
                        f'Please use help of each subcommand. Example: {prefix}help bounty OR {prefix}help bounty cancel_apply')
     return
 
+
+@bounty.error
+@submit.error
+async def bounty_submit_error(ctx, error):
+    prefix = await get_guild_prefix(ctx)
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.message.add_reaction(EMOJI_ERROR)
+        await ctx.send(f'{EMOJI_RED_NO} {ctx.author.mention} Missing argument. '
+                       f'Please use help of each subcommand. Example: {prefix}help bounty OR {prefix}help bounty submit')
+    return
 
 def randomString(stringLength=8):
     letters = string.ascii_lowercase
